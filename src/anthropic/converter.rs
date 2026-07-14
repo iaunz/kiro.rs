@@ -102,6 +102,22 @@ pub fn map_model(model: &str) -> Option<String> {
         }
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
+    } else if model_lower.contains("gpt") {
+        // GPT-5.6 系列：sol / terra / luna
+        // Kiro 后端模型 ID 与名称一致
+        if model_lower.contains("5.6") || model_lower.contains("5-6") {
+            if model_lower.contains("sol") {
+                Some("gpt-5.6-sol".to_string())
+            } else if model_lower.contains("terra") {
+                Some("gpt-5.6-terra".to_string())
+            } else if model_lower.contains("luna") {
+                Some("gpt-5.6-luna".to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -115,6 +131,7 @@ pub fn map_model(model: &str) -> Option<String> {
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped) if mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" || mapped == "claude-opus-4.7" || mapped == "claude-opus-4.8" => 1_000_000,
+        Some(mapped) if mapped.starts_with("gpt-") => 272_000,
         _ => 200_000,
     }
 }
@@ -974,6 +991,22 @@ mod tests {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_gpt_5_6() {
+        assert_eq!(map_model("gpt-5.6-sol"), Some("gpt-5.6-sol".to_string()));
+        assert_eq!(map_model("gpt-5.6-terra"), Some("gpt-5.6-terra".to_string()));
+        assert_eq!(map_model("gpt-5.6-luna"), Some("gpt-5.6-luna".to_string()));
+        // 连字符形式的版本号
+        assert_eq!(map_model("gpt-5-6-sol"), Some("gpt-5.6-sol".to_string()));
+        // 未知 GPT 变体不支持
+        assert!(map_model("gpt-5.6-nova").is_none());
+        assert!(map_model("gpt-4").is_none());
+        // GPT 系列 272K 上下文窗口
+        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
+        assert_eq!(get_context_window_size("gpt-5.6-terra"), 272_000);
+        assert_eq!(get_context_window_size("gpt-5.6-luna"), 272_000);
     }
 
     #[test]

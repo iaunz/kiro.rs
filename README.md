@@ -441,6 +441,9 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
 | `*opus*`（其他） | `claude-opus-4.6` |
 | `*haiku*` | `claude-haiku-4.5` |
+| `gpt-5.6-sol` | `gpt-5.6-sol` |
+| `gpt-5.6-terra` | `gpt-5.6-terra` |
+| `gpt-5.6-luna` | `gpt-5.6-luna` |
 
 ## Admin（可选）
 
