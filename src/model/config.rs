@@ -167,14 +167,18 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
-/// AWS SSO OIDC 自动导入的默认 scopes（与 Kiro IDE / Amazon Q 一致）
+/// AWS SSO OIDC 自动导入的默认 scopes（与 Kiro IDE 一致）
 ///
-/// CodeWhisperer scopes 使 Token 可访问 CodeWhisperer Runtime API；
+/// 与 Kiro Account Manager 参考实现完全对齐的 5 个 CodeWhisperer scopes，
+/// 使取得的 Token 可访问 CodeWhisperer Runtime API（q.{region}.amazonaws.com）；
 /// 生成的 refreshToken 也能通过 IdC 刷新流程续期。
 pub fn default_sso_scopes() -> Vec<String> {
     vec![
         "codewhisperer:completions".to_string(),
         "codewhisperer:analysis".to_string(),
+        "codewhisperer:conversations".to_string(),
+        "codewhisperer:transformations".to_string(),
+        "codewhisperer:taskassist".to_string(),
     ]
 }
 
