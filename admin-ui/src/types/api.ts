@@ -87,3 +87,42 @@ export interface AddCredentialResponse {
   credentialId: number
   email?: string
 }
+
+// ============ AWS SSO OIDC 自动导入 ============
+
+// 支持的 API Region
+export type SsoApiRegion = 'us-east-1' | 'eu-central-1'
+
+// 会话状态
+export type SsoStatus =
+  | 'pending'
+  | 'completed'
+  | 'failed'
+  | 'expired'
+  | 'denied'
+  | 'cancelled'
+
+// 发起 SSO 会话请求
+export interface StartSsoSessionRequest {
+  startUrl: string
+  authRegion: string
+  apiRegion: SsoApiRegion
+  priority?: number
+  endpoint?: string
+}
+
+// SSO 会话状态响应
+export interface SsoSessionResponse {
+  sessionId: string
+  status: SsoStatus
+  startUrl: string
+  authRegion: string
+  apiRegion: string
+  userCode: string
+  verificationUri?: string
+  verificationUriComplete?: string
+  expiresAt: string
+  credentialId?: number
+  email?: string
+  error?: string
+}

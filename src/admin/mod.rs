@@ -21,6 +21,7 @@ mod handlers;
 mod middleware;
 mod router;
 mod service;
+mod sso;
 pub mod types;
 
 pub use middleware::AdminState;

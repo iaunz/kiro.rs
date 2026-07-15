@@ -12,6 +12,9 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
+use super::sso::{
+    SsoError, SsoSessionManager, SsoSessionResponse, StartSsoSessionRequest,
+};
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
     CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
@@ -38,6 +41,8 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// AWS SSO OIDC 会话管理器
+    sso_manager: SsoSessionManager,
 }
 
 impl AdminService {
@@ -50,12 +55,73 @@ impl AdminService {
             .map(|d| d.join("kiro_balance_cache.json"));
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
+        let sso_manager = SsoSessionManager::new(token_manager.clone());
 
         Self {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            sso_manager,
+        }
+    }
+
+    /// 校验端点名（供 SSO 导入等复用）
+    fn validate_endpoint(&self, endpoint: &Option<String>) -> Result<(), AdminServiceError> {
+        if let Some(name) = endpoint {
+            if !self.known_endpoints.contains(name) {
+                let mut known: Vec<&str> =
+                    self.known_endpoints.iter().map(|s| s.as_str()).collect();
+                known.sort();
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知端点 \"{}\"，已注册端点: {:?}",
+                    name, known
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    // ============ AWS SSO OIDC 自动导入 ============
+
+    /// 发起 SSO 会话
+    pub async fn start_sso_session(
+        &self,
+        req: StartSsoSessionRequest,
+    ) -> Result<SsoSessionResponse, AdminServiceError> {
+        // 提前校验端点名，避免用户完成登录后才发现端点无效
+        self.validate_endpoint(&req.endpoint)?;
+        self.sso_manager
+            .start_session(req)
+            .await
+            .map_err(Self::classify_sso_error)
+    }
+
+    /// 查询 SSO 会话状态
+    pub fn get_sso_session(
+        &self,
+        session_id: &str,
+    ) -> Result<SsoSessionResponse, AdminServiceError> {
+        self.sso_manager
+            .get_session(session_id)
+            .map_err(Self::classify_sso_error)
+    }
+
+    /// 取消 SSO 会话
+    pub fn cancel_sso_session(
+        &self,
+        session_id: &str,
+    ) -> Result<SsoSessionResponse, AdminServiceError> {
+        self.sso_manager
+            .cancel_session(session_id)
+            .map_err(Self::classify_sso_error)
+    }
+
+    fn classify_sso_error(e: SsoError) -> AdminServiceError {
+        match e {
+            SsoError::InvalidRequest(msg) => AdminServiceError::InvalidCredential(msg),
+            SsoError::NotFound(msg) => AdminServiceError::NotFoundMessage(msg),
+            SsoError::Upstream(msg) => AdminServiceError::UpstreamError(msg),
         }
     }
 
