@@ -109,6 +109,14 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// AWS SSO OIDC 自动导入时注册客户端使用的 scopes
+    ///
+    /// 默认使用 CodeWhisperer scopes（与 Kiro IDE 一致），使取得的 Token
+    /// 可访问 `q.{region}.amazonaws.com` 的 CodeWhisperer Runtime API。
+    /// 若仅使用 `sso:account:access` 则只能访问 AWS 账号，调用 Kiro API 会 403。
+    #[serde(default = "default_sso_scopes")]
+    pub sso_scopes: Vec<String>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -159,6 +167,17 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+/// AWS SSO OIDC 自动导入的默认 scopes（与 Kiro IDE / Amazon Q 一致）
+///
+/// CodeWhisperer scopes 使 Token 可访问 CodeWhisperer Runtime API；
+/// 生成的 refreshToken 也能通过 IdC 刷新流程续期。
+pub fn default_sso_scopes() -> Vec<String> {
+    vec![
+        "codewhisperer:completions".to_string(),
+        "codewhisperer:analysis".to_string(),
+    ]
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -184,6 +203,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            sso_scopes: default_sso_scopes(),
             config_path: None,
         }
     }

@@ -43,8 +43,13 @@ pub struct RegisterClientResponse {
 }
 
 /// 注册 OIDC 客户端，取得 clientId / clientSecret
+///
+/// `scopes` 决定取得的 Token 拥有的权限。使用 CodeWhisperer scopes
+/// （如 `codewhisperer:completions`）才能访问 Kiro / CodeWhisperer API；
+/// 仅 `sso:account:access` 只能访问 AWS 账号，调用 Kiro API 会 403。
 pub async fn register_client(
     region: &str,
+    scopes: &[String],
     proxy: Option<&ProxyConfig>,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<RegisterClientResponse> {
@@ -54,7 +59,7 @@ pub async fn register_client(
     let body = RegisterClientRequest {
         client_name: CLIENT_NAME.to_string(),
         client_type: "public".to_string(),
-        scopes: vec!["sso:account:access".to_string()],
+        scopes: scopes.to_vec(),
         grant_types: vec![GRANT_DEVICE_CODE.to_string(), "refresh_token".to_string()],
     };
 

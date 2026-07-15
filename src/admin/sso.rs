@@ -233,10 +233,11 @@ impl SsoSessionManager {
         let config = self.token_manager.config();
         let tls_backend = config.tls_backend;
         let proxy = Self::global_proxy(config);
+        let scopes = config.sso_scopes.clone();
 
-        // 1. RegisterClient
+        // 1. RegisterClient（使用 CodeWhisperer scopes，确保 Token 可访问 Kiro API）
         let registered =
-            sso_oidc::register_client(&auth_region, proxy.as_ref(), tls_backend)
+            sso_oidc::register_client(&auth_region, &scopes, proxy.as_ref(), tls_backend)
                 .await
                 .map_err(|e| SsoError::Upstream(e.to_string()))?;
 
