@@ -7,9 +7,10 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_credential_balance, get_load_balancing_mode, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+        add_credential, cancel_sso_session, delete_credential, force_refresh_token,
+        get_all_credentials, get_credential_balance, get_load_balancing_mode, get_sso_session,
+        reset_failure_count, set_credential_disabled, set_credential_priority,
+        set_load_balancing_mode, start_sso_session,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -27,6 +28,9 @@ use super::{
 /// - `GET /credentials/:id/balance` - 获取凭据余额
 /// - `GET /config/load-balancing` - 获取负载均衡模式
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
+/// - `POST /sso/sessions` - 发起 AWS SSO OIDC 自动导入会话
+/// - `GET /sso/sessions/:id` - 查询 SSO 会话状态
+/// - `DELETE /sso/sessions/:id` - 取消 SSO 会话
 ///
 /// # 认证
 /// 需要 Admin API Key 认证，支持：
@@ -47,6 +51,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
+        )
+        .route("/sso/sessions", post(start_sso_session))
+        .route(
+            "/sso/sessions/{id}",
+            get(get_sso_session).delete(cancel_sso_session),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
