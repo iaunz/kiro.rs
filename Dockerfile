@@ -14,7 +14,7 @@ RUN apk add --no-cache musl-dev perl make
 WORKDIR /app
 
 # 可选:通过宿主机代理拉取 crates.io(绕开容器内不受信任的 MITM 证书)。
-# 构建示例:docker build --build-arg BUILD_PROXY=socks5h://host.docker.internal:10808 .
+# 构建示例:docker build --build-arg BUILD_PROXY=socks5://host.docker.internal:10808 .
 # 留空则不使用代理,行为与原先一致。
 ARG BUILD_PROXY=
 ENV ALL_PROXY=${BUILD_PROXY} \
