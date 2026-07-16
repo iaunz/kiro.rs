@@ -53,8 +53,6 @@ pub struct ResponsesRequest {
     #[serde(default)]
     conversation: Value,
     #[serde(default)]
-    include: Vec<String>,
-    #[serde(default)]
     background: bool,
     #[serde(default)]
     store: Option<bool>,
@@ -314,12 +312,11 @@ fn validate_stateless_fields(request: &ResponsesRequest) -> Result<(), RequestEr
             "store",
         ));
     }
-    if !request.include.is_empty() {
-        return Err(RequestError::unsupported(
-            "include is not supported",
-            "include",
-        ));
-    }
+    // `include` is an optional response-enrichment hint (e.g.
+    // "reasoning.encrypted_content"), not a stateful field. Clients such as
+    // Codex send it on every request when response storage is disabled. This
+    // service simply does not emit those extra fields, so we accept and ignore
+    // the parameter rather than rejecting the whole request.
     Ok(())
 }
 
@@ -1549,6 +1546,20 @@ mod tests {
         let error = map_request(req).unwrap_err();
         assert_eq!(error.param.as_deref(), Some("previous_response_id"));
         assert_eq!(error.code.as_deref(), Some("unsupported_parameter"));
+    }
+
+    #[test]
+    fn accepts_include_field() {
+        // Codex sends include=["reasoning.encrypted_content"] whenever response
+        // storage is disabled. The endpoint must accept and ignore it.
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "input": "hi",
+            "store": false,
+            "include": ["reasoning.encrypted_content"]
+        }))
+        .unwrap();
+        assert!(map_request(req).is_ok());
     }
 
     #[test]
