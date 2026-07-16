@@ -658,7 +658,14 @@ impl StreamContext {
                 error_code,
                 error_message,
             } => {
-                tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                // 诊断：错误到达时是否已产出内容（区分「未产出即崩」vs「产出中崩」）
+                tracing::error!(
+                    error_code = %error_code,
+                    error_message = %error_message,
+                    output_tokens_so_far = %self.output_tokens,
+                    message_id = %self.message_id,
+                    "收到错误事件（当前被静默忽略，客户端将看到截断响应）"
+                );
                 Vec::new()
             }
             Event::Exception {
@@ -669,7 +676,14 @@ impl StreamContext {
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
                 }
-                tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                // 诊断：异常到达时是否已产出内容（区分「未产出即崩」vs「产出中崩」）
+                tracing::warn!(
+                    exception_type = %exception_type,
+                    message = %message,
+                    output_tokens_so_far = %self.output_tokens,
+                    message_id = %self.message_id,
+                    "收到异常事件（非 ContentLengthExceeded 时当前被静默忽略，客户端将看到截断响应）"
+                );
                 Vec::new()
             }
             _ => Vec::new(),

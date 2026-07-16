@@ -1078,6 +1078,11 @@ struct ResponseStreamContext {
     incomplete_reason: Option<String>,
     created_at: i64,
     sequence_number: u64,
+    // 诊断埋点：用于区分「上游干等后崩」/「生成中崩」/「生成完卡住」三种失败形态
+    started: Instant,
+    first_content_at: Option<Instant>,
+    last_content_at: Option<Instant>,
+    content_event_count: u64,
 }
 
 impl ResponseStreamContext {
@@ -1102,7 +1107,21 @@ impl ResponseStreamContext {
             incomplete_reason: None,
             created_at: chrono::Utc::now().timestamp(),
             sequence_number: 0,
+            started: Instant::now(),
+            first_content_at: None,
+            last_content_at: None,
+            content_event_count: 0,
         }
+    }
+
+    /// 记录一次「内容帧」到达（assistantResponse / toolUse），用于失败诊断计时
+    fn note_content_frame(&mut self) {
+        let now = Instant::now();
+        if self.first_content_at.is_none() {
+            self.first_content_at = Some(now);
+        }
+        self.last_content_at = Some(now);
+        self.content_event_count += 1;
     }
 
     fn event(&mut self, event_type: &str, mut data: Value) -> Bytes {
@@ -1128,8 +1147,14 @@ impl ResponseStreamContext {
 
     fn process_event(&mut self, event: Event) -> Result<(), String> {
         match event {
-            Event::AssistantResponse(response) => self.text.push_str(&response.content),
-            Event::ToolUse(tool) => self.process_tool(tool)?,
+            Event::AssistantResponse(response) => {
+                self.note_content_frame();
+                self.text.push_str(&response.content);
+            }
+            Event::ToolUse(tool) => {
+                self.note_content_frame();
+                self.process_tool(tool)?;
+            }
             Event::ContextUsage(usage) => {
                 self.input_tokens = (usage.context_usage_percentage
                     * get_context_window_size(&self.model) as f64
@@ -1380,7 +1405,28 @@ impl ResponseStreamContext {
 
     fn failed_events(&mut self, message: impl Into<String>) -> Vec<Bytes> {
         let message = message.into();
-        tracing::error!(response_id = %self.response_id, error = %message, "OpenAI Responses stream failed");
+        // 诊断：区分「上游干等后崩」/「生成中崩」/「生成完卡住」
+        let elapsed_ms = self.started.elapsed().as_millis();
+        let ttfc_ms = self
+            .first_content_at
+            .map(|t| t.duration_since(self.started).as_millis() as i64)
+            .unwrap_or(-1);
+        let since_last_content_ms = self
+            .last_content_at
+            .map(|t| t.elapsed().as_millis() as i64)
+            .unwrap_or(-1);
+        tracing::error!(
+            response_id = %self.response_id,
+            error = %message,
+            elapsed_ms = %elapsed_ms,
+            time_to_first_content_ms = %ttfc_ms,
+            since_last_content_ms = %since_last_content_ms,
+            content_event_count = %self.content_event_count,
+            buffered_text_len = %self.text.len(),
+            pending_tool_calls = %self.call_buffers.len(),
+            completed_tool_calls = %self.calls.len(),
+            "OpenAI Responses stream failed"
+        );
         let error = json!({"code": "upstream_error", "message": message});
         let response = self.snapshot(Vec::new(), Some(error));
         vec![self.event("response.failed", json!({"response": response}))]
