@@ -265,9 +265,12 @@ fn map_request(request: ResponsesRequest) -> Result<MappedRequest, RequestError>
         .instructions
         .filter(|text| !text.is_empty())
         .map(|text| vec![SystemMessage { text }]);
-    let mut messages = map_input(&request.input, &mut system)?;
+    let mut extra_tools = Vec::new();
+    let mut messages = map_input(&request.input, &mut system, &mut extra_tools)?;
     normalize_messages(&mut messages)?;
-    let tools = map_tools(request.tools)?;
+    let mut all_tools = request.tools;
+    all_tools.append(&mut extra_tools);
+    let tools = map_tools(all_tools)?;
     let tool_choice = map_tool_choice(request.tool_choice, &tools)?;
     let (thinking, output_config) = map_reasoning(&request.model, request.reasoning)?;
     let thinking_enabled = thinking.as_ref().is_some_and(Thinking::is_enabled);
@@ -326,6 +329,7 @@ fn validate_stateless_fields(request: &ResponsesRequest) -> Result<(), RequestEr
 fn map_input(
     input: &Value,
     system: &mut Option<Vec<SystemMessage>>,
+    extra_tools: &mut Vec<ResponseTool>,
 ) -> Result<Vec<Message>, RequestError> {
     match input {
         Value::String(text) => {
@@ -343,7 +347,7 @@ fn map_input(
             }
             let mut messages = Vec::new();
             for (index, item) in items.iter().enumerate() {
-                map_input_item(item, index, system, &mut messages)?;
+                map_input_item(item, index, system, &mut messages, extra_tools)?;
             }
             if messages.is_empty() {
                 return Err(RequestError::new(
@@ -365,6 +369,7 @@ fn map_input_item(
     index: usize,
     system: &mut Option<Vec<SystemMessage>>,
     messages: &mut Vec<Message>,
+    extra_tools: &mut Vec<ResponseTool>,
 ) -> Result<(), RequestError> {
     let object = item.as_object().ok_or_else(|| {
         RequestError::new("input items must be objects", format!("input[{index}]"))
@@ -384,12 +389,32 @@ fn map_input_item(
             })?;
             map_message(role, content, index, system, messages)
         }
-        "function_call" => map_function_call(object, index, messages),
-        "function_call_output" => map_function_output(object, index, messages),
-        other => Err(RequestError::new(
-            format!("Unsupported input item type: {other}"),
-            format!("input[{index}].type"),
-        )),
+        // `function_call` carries JSON-string arguments; `custom_tool_call`
+        // (freeform tools) carries a raw string under `input`. Both map to an
+        // assistant tool_use block.
+        "function_call" | "custom_tool_call" => map_function_call(object, index, messages),
+        "function_call_output" | "custom_tool_call_output" => {
+            map_function_output(object, index, messages)
+        }
+        // `additional_tools` is a developer-role item that carries tool
+        // definitions inside the input stream (Codex places tools here instead
+        // of the top-level `tools` field in some turns). Collect them so they
+        // are exposed to the backend alongside any top-level tools.
+        "additional_tools" => {
+            if let Some(tools) = object.get("tools").and_then(Value::as_array) {
+                for tool in tools {
+                    if let Ok(tool) = serde_json::from_value::<ResponseTool>(tool.clone()) {
+                        extra_tools.push(tool);
+                    }
+                }
+            }
+            Ok(())
+        }
+        // Other replayed item types (reasoning, web_search_call, image
+        // generation, tool_search, etc.) have no Anthropic equivalent here.
+        // Codex replays full history each turn when response storage is
+        // disabled, so skip unknown items rather than failing the request.
+        _ => Ok(()),
     }
 }
 
@@ -588,19 +613,30 @@ fn map_function_call(
 ) -> Result<(), RequestError> {
     let call_id = required_string(object, "call_id", index)?;
     let name = required_string(object, "name", index)?;
-    let arguments = required_string(object, "arguments", index)?;
-    let input: Value = serde_json::from_str(arguments).map_err(|error| {
-        RequestError::new(
-            format!("function_call arguments must be valid JSON: {error}"),
-            format!("input[{index}].arguments"),
-        )
-    })?;
-    if !input.is_object() {
-        return Err(RequestError::new(
-            "function_call arguments must encode a JSON object",
-            format!("input[{index}].arguments"),
-        ));
-    }
+    // `function_call` uses `arguments` (a JSON string); `custom_tool_call`
+    // (freeform tools) uses `input` (a raw string that may not be JSON).
+    let (field, raw) = match object.get("arguments").and_then(Value::as_str) {
+        Some(arguments) => ("arguments", arguments),
+        None => ("input", required_string(object, "input", index)?),
+    };
+    // Freeform tool input can be arbitrary text; fall back to a wrapper object
+    // when it is not valid JSON so the backend always receives an object.
+    let input = match serde_json::from_str::<Value>(raw) {
+        Ok(value) if value.is_object() => value,
+        _ if field == "input" => json!({ "input": raw }),
+        Ok(_) => {
+            return Err(RequestError::new(
+                "function_call arguments must encode a JSON object",
+                format!("input[{index}].arguments"),
+            ));
+        }
+        Err(error) => {
+            return Err(RequestError::new(
+                format!("function_call arguments must be valid JSON: {error}"),
+                format!("input[{index}].arguments"),
+            ));
+        }
+    };
     messages.push(Message {
         role: "assistant".to_string(),
         content: json!([{"type": "tool_use", "id": call_id, "name": name, "input": input}]),
@@ -1578,6 +1614,66 @@ mod tests {
             .map(|t| t.name.clone())
             .collect();
         assert_eq!(names, vec!["shell_command", "js", "js_reset"]);
+    }
+
+    #[test]
+    fn collects_tools_from_additional_tools_item() {
+        // Codex may deliver tool definitions via an `additional_tools` input
+        // item instead of the top-level `tools` field.
+        let req = request(json!([
+            {"type": "additional_tools", "role": "developer", "tools": [
+                {"type": "custom", "name": "exec", "description": "run js"},
+                {"type": "function", "name": "wait", "parameters": {"type": "object", "properties": {}}},
+                {"type": "namespace", "name": "collab", "description": "c", "tools": [
+                    {"type": "function", "name": "spawn_agent", "parameters": {"type": "object", "properties": {}}}
+                ]}
+            ]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+        ]));
+        let mapped = map_request(req).unwrap();
+        let names: Vec<_> = mapped
+            .messages
+            .tools
+            .unwrap()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        // `custom` (freeform) has no function schema and is skipped; the
+        // function and flattened namespace tool are exposed.
+        assert_eq!(names, vec!["wait", "spawn_agent"]);
+    }
+
+    #[test]
+    fn skips_unknown_replayed_input_items() {
+        // With response storage disabled Codex replays full history, including
+        // item types with no Anthropic equivalent. These must be ignored.
+        let req = request(json!([
+            {"type": "reasoning", "summary": [], "encrypted_content": "abc"},
+            {"type": "web_search_call", "status": "completed"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+        ]));
+        let mapped = map_request(req).unwrap();
+        assert_eq!(mapped.messages.messages.len(), 1);
+        assert_eq!(mapped.messages.messages[0].role, "user");
+    }
+
+    #[test]
+    fn maps_custom_tool_call_roundtrip() {
+        // Freeform (`custom`) tool calls use `input` (raw string) instead of
+        // `arguments`, and the paired output uses `custom_tool_call_output`.
+        let req = request(json!([
+            {"type": "custom_tool_call", "call_id": "c1", "name": "exec", "input": "console.log(1)"},
+            {"type": "custom_tool_call_output", "call_id": "c1", "output": "1"}
+        ]));
+        let mapped = map_request(req).unwrap();
+        assert_eq!(
+            mapped.messages.messages[0].content,
+            json!([{"type": "tool_use", "id": "c1", "name": "exec", "input": {"input": "console.log(1)"}}])
+        );
+        assert_eq!(
+            mapped.messages.messages[1].content,
+            json!([{"type": "tool_result", "tool_use_id": "c1", "content": "1"}])
+        );
     }
 
     #[test]
