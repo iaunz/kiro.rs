@@ -148,6 +148,7 @@ pub async fn post_response(
     State(state): State<AppState>,
     payload: Result<JsonExtractor<ResponsesRequest>, JsonRejection>,
 ) -> Response {
+    let received_at = Instant::now();
     let payload = match payload {
         Ok(JsonExtractor(payload)) => payload,
         Err(error) => {
@@ -212,6 +213,8 @@ pub async fn post_response(
     };
 
     let response_id = format!("resp_{}", Uuid::new_v4().simple());
+    // 诊断：请求预处理（map/convert/count_tokens/序列化）耗时，与后续 upstream 建流耗时分离
+    let prep_ms = received_at.elapsed().as_millis();
     if mapped.messages.stream {
         handle_stream(
             provider,
@@ -222,6 +225,7 @@ pub async fn post_response(
             mapped.max_output_tokens,
             mapped.thinking_enabled,
             conversion.tool_name_map,
+            prep_ms,
         )
         .await
     } else {
@@ -1489,16 +1493,23 @@ async fn handle_stream(
     max_output_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: HashMap<String, String>,
+    prep_ms: u128,
 ) -> Response {
+    // 诊断：单独计量 call_api_stream（网络 + 重试退避 + 可能的 token 刷新）的耗时，
+    // 这段发生在向客户端吐出任何字节之前——是 Codex「卡住」的主要嫌疑区间。
+    let connect_started = Instant::now();
     let upstream = match provider.call_api_stream(&request_body).await {
         Ok(response) => response,
         Err(error) => return map_provider_error(error),
     };
+    let upstream_connect_ms = connect_started.elapsed().as_millis();
 
     // 诊断：上游已接受请求并建立流（若之后既无 completed 也无 failed，即卡死在等上游）
     tracing::info!(
         response_id = %response_id,
         upstream_status = %upstream.status().as_u16(),
+        prep_ms = %prep_ms,
+        upstream_connect_ms = %upstream_connect_ms,
         "OpenAI Responses upstream stream established"
     );
 
