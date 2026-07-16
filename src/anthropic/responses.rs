@@ -1080,9 +1080,11 @@ struct ResponseStreamContext {
     sequence_number: u64,
     // 诊断埋点：用于区分「上游干等后崩」/「生成中崩」/「生成完卡住」三种失败形态
     started: Instant,
+    first_chunk_at: Option<Instant>,
     first_content_at: Option<Instant>,
     last_content_at: Option<Instant>,
     content_event_count: u64,
+    keep_alive_count: u64,
 }
 
 impl ResponseStreamContext {
@@ -1108,9 +1110,41 @@ impl ResponseStreamContext {
             created_at: chrono::Utc::now().timestamp(),
             sequence_number: 0,
             started: Instant::now(),
+            first_chunk_at: None,
             first_content_at: None,
             last_content_at: None,
             content_event_count: 0,
+            keep_alive_count: 0,
+        }
+    }
+
+    /// 诊断快照：当前流的关键计时/计数，供各生命周期日志复用
+    fn diag_fields(&self) -> (u128, i64, i64, i64) {
+        let elapsed_ms = self.started.elapsed().as_millis();
+        let ttfb_ms = self
+            .first_chunk_at
+            .map(|t| t.duration_since(self.started).as_millis() as i64)
+            .unwrap_or(-1);
+        let ttfc_ms = self
+            .first_content_at
+            .map(|t| t.duration_since(self.started).as_millis() as i64)
+            .unwrap_or(-1);
+        let since_last_content_ms = self
+            .last_content_at
+            .map(|t| t.elapsed().as_millis() as i64)
+            .unwrap_or(-1);
+        (elapsed_ms, ttfb_ms, ttfc_ms, since_last_content_ms)
+    }
+
+    /// 记录首个原始数据 chunk 到达（区分「上游建立后干等」vs「上游正常回流」）
+    fn note_first_chunk(&mut self) {
+        if self.first_chunk_at.is_none() {
+            self.first_chunk_at = Some(Instant::now());
+            tracing::debug!(
+                response_id = %self.response_id,
+                time_to_first_byte_ms = %self.started.elapsed().as_millis(),
+                "OpenAI Responses first upstream byte"
+            );
         }
     }
 
@@ -1262,6 +1296,21 @@ impl ResponseStreamContext {
             ));
         }
 
+        // 诊断：上游流正常结束（区分「正常完成」与「卡死在等上游」——后者不会有这条日志）
+        let (elapsed_ms, ttfb_ms, ttfc_ms, since_last_content_ms) = self.diag_fields();
+        tracing::info!(
+            response_id = %self.response_id,
+            elapsed_ms = %elapsed_ms,
+            time_to_first_byte_ms = %ttfb_ms,
+            time_to_first_content_ms = %ttfc_ms,
+            since_last_content_ms = %since_last_content_ms,
+            content_event_count = %self.content_event_count,
+            keep_alive_count = %self.keep_alive_count,
+            buffered_text_len = %self.text.len(),
+            completed_tool_calls = %self.calls.len(),
+            "OpenAI Responses stream completed"
+        );
+
         let text = if self.thinking_enabled {
             remove_complete_thinking_blocks(std::mem::take(&mut self.text))
         } else {
@@ -1406,22 +1455,16 @@ impl ResponseStreamContext {
     fn failed_events(&mut self, message: impl Into<String>) -> Vec<Bytes> {
         let message = message.into();
         // 诊断：区分「上游干等后崩」/「生成中崩」/「生成完卡住」
-        let elapsed_ms = self.started.elapsed().as_millis();
-        let ttfc_ms = self
-            .first_content_at
-            .map(|t| t.duration_since(self.started).as_millis() as i64)
-            .unwrap_or(-1);
-        let since_last_content_ms = self
-            .last_content_at
-            .map(|t| t.elapsed().as_millis() as i64)
-            .unwrap_or(-1);
+        let (elapsed_ms, ttfb_ms, ttfc_ms, since_last_content_ms) = self.diag_fields();
         tracing::error!(
             response_id = %self.response_id,
             error = %message,
             elapsed_ms = %elapsed_ms,
+            time_to_first_byte_ms = %ttfb_ms,
             time_to_first_content_ms = %ttfc_ms,
             since_last_content_ms = %since_last_content_ms,
             content_event_count = %self.content_event_count,
+            keep_alive_count = %self.keep_alive_count,
             buffered_text_len = %self.text.len(),
             pending_tool_calls = %self.call_buffers.len(),
             completed_tool_calls = %self.calls.len(),
@@ -1451,6 +1494,13 @@ async fn handle_stream(
         Ok(response) => response,
         Err(error) => return map_provider_error(error),
     };
+
+    // 诊断：上游已接受请求并建立流（若之后既无 completed 也无 failed，即卡死在等上游）
+    tracing::info!(
+        response_id = %response_id,
+        upstream_status = %upstream.status().as_u16(),
+        "OpenAI Responses upstream stream established"
+    );
 
     let mut ctx = ResponseStreamContext::new(
         response_id,
@@ -1494,12 +1544,14 @@ fn build_stream(
                 tokio::select! {
                     biased;
                     _ = keep_alive.tick() => {
+                        ctx.keep_alive_count += 1;
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(keep_alive_comment())];
                         return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, keep_alive)));
                     }
                     chunk = body_stream.next() => {
                         match chunk {
                             Some(Ok(chunk)) => {
+                                ctx.note_first_chunk();
                                 if let Err(error) = decoder.feed(&chunk) {
                                     tracing::warn!("缓冲区溢出: {}", error);
                                 }
