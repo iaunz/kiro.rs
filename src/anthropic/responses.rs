@@ -14,7 +14,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::time::{Instant, interval_at};
+use tokio::time::{Instant, interval_at, timeout};
 use uuid::Uuid;
 
 use crate::{
@@ -35,6 +35,9 @@ use super::{
 
 const DEFAULT_MAX_OUTPUT_TOKENS: i32 = 4096;
 const KEEP_ALIVE_SECS: u64 = 25;
+/// Maximum time spent acquiring a token, retrying, and waiting for upstream headers.
+/// No SSE bytes can be sent before this phase completes, so it must be bounded.
+const UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Deserialize)]
 pub struct ResponsesRequest {
@@ -677,30 +680,28 @@ fn map_function_output(
 }
 
 fn normalize_messages(messages: &mut [Message]) -> Result<(), RequestError> {
-    if !messages.iter().any(|message| message.role == "user") {
-        // 诊断：无任何 user 消息（罕见）
+    let Some(last_user_index) = messages.iter().rposition(|message| message.role == "user") else {
         tracing::warn!(
-            role_sequence = ?messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
-            "responses input 缺少 user 消息，拒绝请求"
+            message_count = messages.len(),
+            "responses input has no user message; rejecting request"
         );
         return Err(RequestError::new(
             "input must contain a user message or function_call_output",
             "input",
         ));
-    }
-    if messages.last().is_none_or(|message| message.role != "user") {
-        // 诊断：末条非 user——通常是 Codex 重连时重放的历史以未完成的 function_call(assistant tool_use)结尾，
-        // 缺少对应的 function_call_output。这是「max_output_tokens 误判 → 重连 → 结尾是半截 function_call」链条的下游。
+    };
+
+    // Codex can replay a partially completed turn after a transport error. In that case the
+    // history ends in assistant function calls without their function_call_output items. The
+    // converter already truncates such prefill to the last user message, so allow that recovery
+    // path instead of rejecting the retry and leaving the task permanently stuck.
+    let trailing_message_count = messages.len() - last_user_index - 1;
+    if trailing_message_count > 0 {
         tracing::warn!(
-            last_role = %messages.last().map(|m| m.role.as_str()).unwrap_or("<none>"),
-            message_count = %messages.len(),
-            role_sequence = ?messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
-            "responses input 末条非 user，拒绝请求（疑似重连历史以未完成 function_call 结尾）"
+            message_count = messages.len(),
+            trailing_message_count = trailing_message_count,
+            "responses input ends in unfinished assistant messages; falling back to the last user message"
         );
-        return Err(RequestError::new(
-            "The final input item must be a user message or function_call_output",
-            "input",
-        ));
     }
     Ok(())
 }
@@ -965,10 +966,9 @@ fn collect_response(
             .unwrap_or_else(|_| Value::String(call.arguments.clone()));
         token_blocks.push(json!({"type": "tool_use", "input": input}));
     }
+    // This count is an estimate used for usage reporting only. It can exceed the requested
+    // limit even when upstream ended normally, so it must not mark the response incomplete.
     let output_tokens = token::estimate_output_tokens(&token_blocks);
-    if incomplete_reason.is_none() && output_tokens >= max_output_tokens {
-        incomplete_reason = Some("max_output_tokens".to_string());
-    }
 
     Ok(CollectedResponse {
         text_item_id: (!text.is_empty()).then(|| format!("msg_{}", Uuid::new_v4().simple())),
@@ -1287,9 +1287,6 @@ impl ResponseStreamContext {
             blocks.push(json!({"type": "tool_use", "input": input}));
         }
         let output_tokens = token::estimate_output_tokens(&blocks);
-        let incomplete_reason = self.incomplete_reason.clone().or_else(|| {
-            (output_tokens >= self.max_output_tokens).then(|| "max_output_tokens".to_string())
-        });
         CollectedResponse {
             text,
             text_item_id,
@@ -1297,7 +1294,7 @@ impl ResponseStreamContext {
             input_tokens: self.input_tokens,
             output_tokens,
             max_output_tokens: self.max_output_tokens,
-            incomplete_reason,
+            incomplete_reason: self.incomplete_reason.clone(),
             created_at: self.created_at,
         }
     }
@@ -1315,10 +1312,8 @@ impl ResponseStreamContext {
 
         // 诊断：上游流正常结束（区分「正常完成」与「卡死在等上游」——后者不会有这条日志）
         let (elapsed_ms, ttfb_ms, ttfc_ms, since_last_content_ms) = self.diag_fields();
-        // 诊断：预演 collected() 的 incomplete 判定，坐实「上游正常完成却被估算误判为 max_output_tokens」。
-        // upstream_incomplete_reason=None 且 forced_incomplete_reason=Some(max_output_tokens)
-        // 即为误判：上游本是 end_turn，我们仅因估算 output_tokens>=max_output_tokens 就标 incomplete，
-        // 导致 Codex 报 "Incomplete response ... reason: max_output_tokens" 并触发重连。
+        // Token estimates are for usage and diagnostics only; only explicit upstream events
+        // can mark a response as incomplete.
         let diag_output_tokens = {
             let mut blocks = Vec::new();
             if !self.text.is_empty() {
@@ -1331,8 +1326,7 @@ impl ResponseStreamContext {
             }
             token::estimate_output_tokens(&blocks)
         };
-        let forced_incomplete = self.incomplete_reason.is_none()
-            && diag_output_tokens >= self.max_output_tokens;
+        let estimate_exceeds_limit = diag_output_tokens >= self.max_output_tokens;
         tracing::info!(
             response_id = %self.response_id,
             elapsed_ms = %elapsed_ms,
@@ -1346,7 +1340,7 @@ impl ResponseStreamContext {
             estimated_output_tokens = %diag_output_tokens,
             max_output_tokens = %self.max_output_tokens,
             upstream_incomplete_reason = ?self.incomplete_reason,
-            forced_incomplete_by_estimate = %forced_incomplete,
+            estimate_exceeds_limit = estimate_exceeds_limit,
             "OpenAI Responses stream completed"
         );
 
@@ -1533,9 +1527,30 @@ async fn handle_stream(
     // 诊断：单独计量 call_api_stream（网络 + 重试退避 + 可能的 token 刷新）的耗时，
     // 这段发生在向客户端吐出任何字节之前——是 Codex「卡住」的主要嫌疑区间。
     let connect_started = Instant::now();
-    let upstream = match provider.call_api_stream(&request_body).await {
-        Ok(response) => response,
-        Err(error) => return map_provider_error(error),
+    let upstream = match timeout(
+        Duration::from_secs(UPSTREAM_CONNECT_TIMEOUT_SECS),
+        provider.call_api_stream(&request_body),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => return map_provider_error(error),
+        Err(_) => {
+            let elapsed_ms = connect_started.elapsed().as_millis();
+            tracing::error!(
+                response_id = %response_id,
+                elapsed_ms = elapsed_ms,
+                timeout_secs = UPSTREAM_CONNECT_TIMEOUT_SECS,
+                "OpenAI Responses upstream connection timed out"
+            );
+            return api_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "Upstream API did not establish a response within {} seconds",
+                    UPSTREAM_CONNECT_TIMEOUT_SECS
+                ),
+            );
+        }
     };
     let upstream_connect_ms = connect_started.elapsed().as_millis();
 
@@ -1853,6 +1868,20 @@ mod tests {
     }
 
     #[test]
+    fn accepts_replayed_history_ending_in_unfinished_assistant_call() {
+        let mapped = map_request(request(json!([
+            {"type": "message", "role": "user", "content": "run it"},
+            {"type": "function_call", "call_id": "call_unfinished", "name": "exec", "arguments": "{}"}
+        ])))
+        .unwrap();
+
+        assert_eq!(mapped.messages.messages.len(), 2);
+        assert_eq!(mapped.messages.messages[0].role, "user");
+        assert_eq!(mapped.messages.messages[1].role, "assistant");
+        assert!(convert_request(&mapped.messages).is_ok());
+    }
+
+    #[test]
     fn thinking_suffix_enables_reasoning() {
         let mapped = map_request(request_with_model("claude-opus-4-8-thinking")).unwrap();
         assert!(mapped.thinking_enabled);
@@ -1978,12 +2007,34 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_reason_switches_terminal_event() {
+    fn explicit_upstream_incomplete_reason_switches_terminal_event() {
         let mut ctx = context();
         let _ = ctx.initial_events();
         ctx.incomplete_reason = Some("context_window_exceeded".to_string());
         ctx.text.push_str("partial");
         let chunks = ctx.finish_events();
         assert_eq!(event_types(&chunks).last().unwrap(), "response.incomplete");
+    }
+
+    #[test]
+    fn token_estimate_does_not_mark_normal_upstream_completion_incomplete() {
+        let mut ctx = context();
+        ctx.max_output_tokens = 1;
+        let _ = ctx.initial_events();
+        ctx.text
+            .push_str("This normal response is deliberately longer than one estimated token.");
+        let chunks = ctx.finish_events();
+
+        assert_eq!(event_types(&chunks).last().unwrap(), "response.completed");
+        let terminal = String::from_utf8_lossy(chunks.last().unwrap());
+        let value: Value = serde_json::from_str(
+            terminal
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["response"]["status"], "completed");
+        assert!(value["response"]["incomplete_details"].is_null());
     }
 }
