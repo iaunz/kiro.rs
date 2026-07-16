@@ -12,6 +12,7 @@ use crate::kiro::provider::KiroProvider;
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
+    responses::post_response,
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -23,6 +24,8 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `GET /v1/models` - 获取可用模型列表
 /// - `POST /v1/messages` - 创建消息（对话）
 /// - `POST /v1/messages/count_tokens` - 计算 token 数量
+/// - `POST /v1/responses` - OpenAI Responses API 兼容端点
+/// - `GET /cc/v1/models` - 获取可用模型列表（与 /v1/models 相同）
 ///
 /// # 认证
 /// 所有 `/v1` 路径需要 API Key 认证，支持：
@@ -49,6 +52,7 @@ pub fn create_router_with_provider(
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
+        .route("/responses", post(post_response))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -57,6 +61,7 @@ pub fn create_router_with_provider(
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
     // 与 /v1 的区别：流式响应会等待 contextUsageEvent 后再发送 message_start
     let cc_v1_routes = Router::new()
+        .route("/models", get(get_models))
         .route("/messages", post(post_messages_cc))
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
