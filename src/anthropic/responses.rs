@@ -678,12 +678,25 @@ fn map_function_output(
 
 fn normalize_messages(messages: &mut [Message]) -> Result<(), RequestError> {
     if !messages.iter().any(|message| message.role == "user") {
+        // 诊断：无任何 user 消息（罕见）
+        tracing::warn!(
+            role_sequence = ?messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            "responses input 缺少 user 消息，拒绝请求"
+        );
         return Err(RequestError::new(
             "input must contain a user message or function_call_output",
             "input",
         ));
     }
     if messages.last().is_none_or(|message| message.role != "user") {
+        // 诊断：末条非 user——通常是 Codex 重连时重放的历史以未完成的 function_call(assistant tool_use)结尾，
+        // 缺少对应的 function_call_output。这是「max_output_tokens 误判 → 重连 → 结尾是半截 function_call」链条的下游。
+        tracing::warn!(
+            last_role = %messages.last().map(|m| m.role.as_str()).unwrap_or("<none>"),
+            message_count = %messages.len(),
+            role_sequence = ?messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            "responses input 末条非 user，拒绝请求（疑似重连历史以未完成 function_call 结尾）"
+        );
         return Err(RequestError::new(
             "The final input item must be a user message or function_call_output",
             "input",
@@ -1302,6 +1315,24 @@ impl ResponseStreamContext {
 
         // 诊断：上游流正常结束（区分「正常完成」与「卡死在等上游」——后者不会有这条日志）
         let (elapsed_ms, ttfb_ms, ttfc_ms, since_last_content_ms) = self.diag_fields();
+        // 诊断：预演 collected() 的 incomplete 判定，坐实「上游正常完成却被估算误判为 max_output_tokens」。
+        // upstream_incomplete_reason=None 且 forced_incomplete_reason=Some(max_output_tokens)
+        // 即为误判：上游本是 end_turn，我们仅因估算 output_tokens>=max_output_tokens 就标 incomplete，
+        // 导致 Codex 报 "Incomplete response ... reason: max_output_tokens" 并触发重连。
+        let diag_output_tokens = {
+            let mut blocks = Vec::new();
+            if !self.text.is_empty() {
+                blocks.push(json!({"type": "text", "text": self.text}));
+            }
+            for call in &self.calls {
+                let input = serde_json::from_str::<Value>(&call.arguments)
+                    .unwrap_or_else(|_| Value::String(call.arguments.clone()));
+                blocks.push(json!({"type": "tool_use", "input": input}));
+            }
+            token::estimate_output_tokens(&blocks)
+        };
+        let forced_incomplete = self.incomplete_reason.is_none()
+            && diag_output_tokens >= self.max_output_tokens;
         tracing::info!(
             response_id = %self.response_id,
             elapsed_ms = %elapsed_ms,
@@ -1312,6 +1343,10 @@ impl ResponseStreamContext {
             keep_alive_count = %self.keep_alive_count,
             buffered_text_len = %self.text.len(),
             completed_tool_calls = %self.calls.len(),
+            estimated_output_tokens = %diag_output_tokens,
+            max_output_tokens = %self.max_output_tokens,
+            upstream_incomplete_reason = ?self.incomplete_reason,
+            forced_incomplete_by_estimate = %forced_incomplete,
             "OpenAI Responses stream completed"
         );
 
