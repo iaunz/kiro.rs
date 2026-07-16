@@ -70,6 +70,9 @@ struct ResponseTool {
     name: Option<String>,
     description: Option<String>,
     parameters: Option<Value>,
+    /// Inner function tools for `type: "namespace"` grouping tools.
+    #[serde(default)]
+    tools: Vec<ResponseTool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -650,40 +653,53 @@ fn normalize_messages(messages: &mut [Message]) -> Result<(), RequestError> {
 }
 
 fn map_tools(tools: Vec<ResponseTool>) -> Result<Vec<Tool>, RequestError> {
-    tools
-        .into_iter()
-        .enumerate()
-        .map(|(index, tool)| {
-            if tool.tool_type != "function" {
-                return Err(RequestError::new(
-                    format!("Unsupported tool type: {}", tool.tool_type),
-                    format!("tools[{index}].type"),
-                ));
+    let mut mapped = Vec::new();
+    for (index, tool) in tools.into_iter().enumerate() {
+        match tool.tool_type.as_str() {
+            "function" => mapped.push(map_function_tool(tool, format!("tools[{index}]"))?),
+            // `namespace` is a grouping container: its `tools` array holds
+            // ordinary function tools with globally unique leaf names. Flatten
+            // them into standalone functions so the backend sees every callable.
+            "namespace" => {
+                for (inner_index, inner) in tool.tools.into_iter().enumerate() {
+                    if inner.tool_type != "function" {
+                        continue;
+                    }
+                    mapped.push(map_function_tool(
+                        inner,
+                        format!("tools[{index}].tools[{inner_index}]"),
+                    )?);
+                }
             }
-            let name = tool.name.filter(|name| !name.is_empty()).ok_or_else(|| {
-                RequestError::new(
-                    "function tool name is required",
-                    format!("tools[{index}].name"),
-                )
-            })?;
-            let parameters = tool
-                .parameters
-                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-            let input_schema = parameters.as_object().cloned().ok_or_else(|| {
-                RequestError::new(
-                    "function tool parameters must be a JSON object",
-                    format!("tools[{index}].parameters"),
-                )
-            })?;
-            Ok(Tool {
-                tool_type: None,
-                name,
-                description: tool.description.unwrap_or_default(),
-                input_schema: input_schema.into_iter().collect(),
-                max_uses: None,
-            })
-        })
-        .collect()
+            // Other built-in tool types (e.g. `web_search`) have no function
+            // schema and are not backed by this service. Skip them rather than
+            // rejecting the whole request so the turn can still proceed.
+            _ => continue,
+        }
+    }
+    Ok(mapped)
+}
+
+fn map_function_tool(tool: ResponseTool, param: String) -> Result<Tool, RequestError> {
+    let name = tool.name.filter(|name| !name.is_empty()).ok_or_else(|| {
+        RequestError::new("function tool name is required", format!("{param}.name"))
+    })?;
+    let parameters = tool
+        .parameters
+        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+    let input_schema = parameters.as_object().cloned().ok_or_else(|| {
+        RequestError::new(
+            "function tool parameters must be a JSON object",
+            format!("{param}.parameters"),
+        )
+    })?;
+    Ok(Tool {
+        tool_type: None,
+        name,
+        description: tool.description.unwrap_or_default(),
+        input_schema: input_schema.into_iter().collect(),
+        max_uses: None,
+    })
 }
 
 fn map_tool_choice(choice: Option<Value>, tools: &[Tool]) -> Result<Option<Value>, RequestError> {
@@ -1537,6 +1553,31 @@ mod tests {
             mapped.messages.messages[1].content,
             json!([{"type": "tool_result", "tool_use_id": "call_1", "content": "done"}])
         );
+    }
+
+    #[test]
+    fn flattens_namespace_tools_and_skips_builtins() {
+        // Codex sends `namespace` grouping tools (with a nested `tools` array)
+        // and built-in types like `web_search` alongside plain functions.
+        let mut req = request(json!("hi"));
+        req.tools = serde_json::from_value(json!([
+            {"type": "function", "name": "shell_command", "parameters": {"type": "object", "properties": {}}},
+            {"type": "namespace", "name": "mcp__node_repl", "description": "node repl", "tools": [
+                {"type": "function", "name": "js", "parameters": {"type": "object", "properties": {}}},
+                {"type": "function", "name": "js_reset", "parameters": {"type": "object", "properties": {}}}
+            ]},
+            {"type": "web_search", "external_web_access": true}
+        ]))
+        .unwrap();
+        let mapped = map_request(req).unwrap();
+        let names: Vec<_> = mapped
+            .messages
+            .tools
+            .unwrap()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        assert_eq!(names, vec!["shell_command", "js", "js_reset"]);
     }
 
     #[test]
