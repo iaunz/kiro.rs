@@ -11,6 +11,6 @@
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
-/docs
+/references
 /admin-ui/.pnpm-store/
 /scripts/
