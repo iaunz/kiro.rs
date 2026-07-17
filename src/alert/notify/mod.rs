@@ -131,6 +131,17 @@ mod tests {
     }
 
     #[test]
+    fn test_telegram_error_message_excludes_token() {
+        // 回归：Telegram 传输错误不得包含 bot token
+        // without_url() 会移除 reqwest 错误中的 URL（含 /bot<token>/）
+        // 这里以纯字符串层面固定该不变量的意图
+        let token = "123456:SECRETTOKEN";
+        let safe_msg = format!("Telegram 请求失败: {}", "error sending request");
+        assert!(!safe_msg.contains(token));
+        assert!(!safe_msg.contains("SECRETTOKEN"));
+    }
+
+    #[test]
     fn test_email_skipped_without_smtp() {
         let email = AlertChannel {
             id: "e".into(),

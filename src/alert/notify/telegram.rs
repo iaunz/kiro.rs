@@ -26,7 +26,9 @@ impl TelegramNotifier {
                 "parse_mode": "HTML",
             }))
             .send()
-            .await?;
+            .await
+            // without_url() 移除 reqwest 错误中的 URL（含 /bot<token>/），避免 bot token 泄漏到错误日志
+            .map_err(|e| anyhow::anyhow!("Telegram 请求失败: {}", e.without_url()))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let msg = resp.text().await.unwrap_or_default();
