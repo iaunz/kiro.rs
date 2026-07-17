@@ -1,6 +1,11 @@
 //! OpenAI Responses API compatibility layer.
 
-use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Error;
 use axum::{
@@ -183,6 +188,15 @@ pub async fn post_response(
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };
 
+    let available_tool_names: HashSet<String> = mapped
+        .messages
+        .tools
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .map(|tool| tool.name.clone())
+        .collect();
+
     let conversion = match convert_request(&mapped.messages) {
         Ok(result) => result,
         Err(error) => {
@@ -228,6 +242,7 @@ pub async fn post_response(
             mapped.max_output_tokens,
             mapped.thinking_enabled,
             conversion.tool_name_map,
+            available_tool_names,
             prep_ms,
         )
         .await
@@ -241,6 +256,7 @@ pub async fn post_response(
             mapped.max_output_tokens,
             mapped.thinking_enabled,
             conversion.tool_name_map,
+            available_tool_names,
         )
         .await
     }
@@ -848,6 +864,7 @@ async fn handle_non_stream(
     max_output_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: HashMap<String, String>,
+    available_tool_names: HashSet<String>,
 ) -> Response {
     let response = match provider.call_api(&request_body).await {
         Ok(response) => response,
@@ -869,6 +886,7 @@ async fn handle_non_stream(
         max_output_tokens,
         thinking_enabled,
         &tool_name_map,
+        &available_tool_names,
     ) {
         Ok(collected) => collected,
         Err(error) => return api_error(StatusCode::BAD_GATEWAY, error),
@@ -884,6 +902,7 @@ fn collect_response(
     max_output_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: &HashMap<String, String>,
+    available_tool_names: &HashSet<String>,
 ) -> Result<CollectedResponse, String> {
     let mut decoder = EventStreamDecoder::new();
     decoder
@@ -956,6 +975,17 @@ fn collect_response(
 
     if thinking_enabled {
         text = remove_complete_thinking_blocks(text);
+    }
+    if calls.is_empty() {
+        if let Some(call) = recover_leaked_function_call(&text, available_tool_names, tool_name_map)
+        {
+            tracing::warn!(
+                tool_name = %call.name,
+                "Recovered function call emitted as assistant text"
+            );
+            text.clear();
+            calls.push(call);
+        }
     }
     let mut token_blocks = Vec::new();
     if !text.is_empty() {
@@ -1082,12 +1112,77 @@ fn map_provider_error(error: Error) -> Response {
     )
 }
 
+/// Recovers the narrow malformed form occasionally emitted when the upstream model writes an
+/// internal `to=functions.<name>` recipient marker as assistant text instead of a tool-use event.
+/// Requiring a declared tool name prevents ordinary prose and code examples from being converted.
+fn recover_leaked_function_call(
+    text: &str,
+    available_tool_names: &HashSet<String>,
+    tool_name_map: &HashMap<String, String>,
+) -> Option<CollectedCall> {
+    const MARKER: &str = "to=functions.";
+    const MAX_PREFIX_LEN: usize = 256;
+    const MAX_ARGUMENT_GAP: usize = 256;
+
+    let marker_start = text.find(MARKER)?;
+    if marker_start > MAX_PREFIX_LEN
+        || text[..marker_start]
+            .chars()
+            .any(|character| character.is_alphanumeric())
+    {
+        return None;
+    }
+
+    let name_start = marker_start + MARKER.len();
+    let name_len = text[name_start..]
+        .chars()
+        .take_while(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+        .map(char::len_utf8)
+        .sum::<usize>();
+    if name_len == 0 {
+        return None;
+    }
+
+    let emitted_name = &text[name_start..name_start + name_len];
+    let original_name = tool_name_map
+        .get(emitted_name)
+        .map(String::as_str)
+        .unwrap_or(emitted_name);
+    if !available_tool_names.contains(emitted_name) && !available_tool_names.contains(original_name)
+    {
+        return None;
+    }
+
+    let after_name = &text[name_start + name_len..];
+    let arguments_start = after_name.find('{')?;
+    if arguments_start > MAX_ARGUMENT_GAP {
+        return None;
+    }
+    let arguments = serde_json::Deserializer::from_str(&after_name[arguments_start..])
+        .into_iter::<Value>()
+        .next()?
+        .ok()?;
+    if !arguments.is_object() {
+        return None;
+    }
+
+    Some(CollectedCall {
+        item_id: format!("fc_{}", Uuid::new_v4().simple()),
+        call_id: format!("call_{}", Uuid::new_v4().simple()),
+        name: original_name.to_string(),
+        arguments: serde_json::to_string(&arguments).ok()?,
+    })
+}
+
 struct ResponseStreamContext {
     response_id: String,
     model: String,
     max_output_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: HashMap<String, String>,
+    available_tool_names: HashSet<String>,
     text: String,
     calls: Vec<CollectedCall>,
     call_buffers: HashMap<String, (String, String)>,
@@ -1111,6 +1206,7 @@ impl ResponseStreamContext {
         max_output_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+        available_tool_names: HashSet<String>,
         input_tokens: i32,
     ) -> Self {
         Self {
@@ -1119,6 +1215,7 @@ impl ResponseStreamContext {
             max_output_tokens,
             thinking_enabled,
             tool_name_map,
+            available_tool_names,
             text: String::new(),
             calls: Vec::new(),
             call_buffers: HashMap::new(),
@@ -1311,6 +1408,22 @@ impl ResponseStreamContext {
         }
 
         // 诊断：上游流正常结束（区分「正常完成」与「卡死在等上游」——后者不会有这条日志）
+        if self.calls.is_empty() {
+            if let Some(call) = recover_leaked_function_call(
+                &self.text,
+                &self.available_tool_names,
+                &self.tool_name_map,
+            ) {
+                tracing::warn!(
+                    response_id = %self.response_id,
+                    tool_name = %call.name,
+                    "Recovered function call emitted as assistant text"
+                );
+                self.text.clear();
+                self.calls.push(call);
+            }
+        }
+
         let (elapsed_ms, ttfb_ms, ttfc_ms, since_last_content_ms) = self.diag_fields();
         // Token estimates are for usage and diagnostics only; only explicit upstream events
         // can mark a response as incomplete.
@@ -1522,6 +1635,7 @@ async fn handle_stream(
     max_output_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: HashMap<String, String>,
+    available_tool_names: HashSet<String>,
     prep_ms: u128,
 ) -> Response {
     // 诊断：单独计量 call_api_stream（网络 + 重试退避 + 可能的 token 刷新）的耗时，
@@ -1569,6 +1683,7 @@ async fn handle_stream(
         max_output_tokens,
         thinking_enabled,
         tool_name_map,
+        available_tool_names,
         input_tokens,
     );
     let initial = ctx.initial_events();
@@ -1929,6 +2044,7 @@ mod tests {
             4096,
             false,
             HashMap::new(),
+            HashSet::new(),
             10,
         )
     }
@@ -1980,6 +2096,65 @@ mod tests {
             assert_eq!(seq, previous + 1);
             previous = seq;
         }
+    }
+
+    #[test]
+    fn recovers_declared_tool_call_leaked_as_text() {
+        let text = r#"+ +#+#+#+#+#+ to=functions.view_image  ... not commentary?
+{"path":"C:\\Users\\iaun\\wechat_account_detail.png"}  ... wait tool needs commentary recipient."#;
+        let tools = HashSet::from(["view_image".to_string()]);
+
+        let call = recover_leaked_function_call(text, &tools, &HashMap::new()).unwrap();
+
+        assert_eq!(call.name, "view_image");
+        assert_eq!(
+            serde_json::from_str::<Value>(&call.arguments).unwrap(),
+            json!({"path": r"C:\Users\iaun\wechat_account_detail.png"})
+        );
+    }
+
+    #[test]
+    fn leaked_tool_call_recovery_requires_a_declared_tool() {
+        let text = r#"to=functions.view_image
+{"path":"image.png"}"#;
+
+        assert!(recover_leaked_function_call(text, &HashSet::new(), &HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn leaked_tool_call_recovery_preserves_ordinary_text_examples() {
+        let text = r#"For example, to=functions.view_image with {"path":"image.png"}."#;
+        let tools = HashSet::from(["view_image".to_string()]);
+
+        assert!(recover_leaked_function_call(text, &tools, &HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn stream_recovers_leaked_tool_call_as_function_call_events() {
+        let mut ctx = context();
+        ctx.available_tool_names.insert("view_image".to_string());
+        let _ = ctx.initial_events();
+        ctx.text.push_str(
+            r#"+ +#+#+#+#+#+ to=functions.view_image
+{"path":"C:\\Users\\iaun\\wechat_account_detail.png"}  ... wait"#,
+        );
+
+        let chunks = ctx.finish_events();
+        let types = event_types(&chunks);
+
+        assert!(!types.contains(&"response.output_text.delta".to_string()));
+        assert!(types.contains(&"response.function_call_arguments.delta".to_string()));
+        assert!(types.contains(&"response.function_call_arguments.done".to_string()));
+        let terminal = String::from_utf8_lossy(chunks.last().unwrap());
+        let value: Value = serde_json::from_str(
+            terminal
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["response"]["output"][0]["type"], "function_call");
+        assert_eq!(value["response"]["output"][0]["name"], "view_image");
     }
 
     #[test]
