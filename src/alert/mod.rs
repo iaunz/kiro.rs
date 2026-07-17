@@ -1,10 +1,14 @@
 //! Credit 预警子系统
 
 pub mod config;
+pub mod handlers;
 pub mod notify;
 pub mod poller;
 pub mod smtp_settings;
 pub mod state;
+pub mod types;
+
+pub use handlers::{create_alert_router, AlertState as AlertRouterState};
 
 use std::path::PathBuf;
 use std::sync::Arc;
