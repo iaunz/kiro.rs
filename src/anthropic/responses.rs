@@ -40,6 +40,7 @@ use super::{
 
 const DEFAULT_MAX_OUTPUT_TOKENS: i32 = 4096;
 const KEEP_ALIVE_SECS: u64 = 25;
+const TOOL_TURN_COMPLETION_POLICY: &str = "When function tools are available, do not end a turn after only announcing or describing the next action. If the request still requires an action, call the appropriate tool in the same turn. Otherwise, provide the final result.";
 /// Maximum time spent acquiring a token, retrying, and waiting for upstream headers.
 /// No SSE bytes can be sent before this phase completes, so it must be bounded.
 const UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 120;
@@ -295,6 +296,17 @@ fn map_request(request: ResponsesRequest) -> Result<MappedRequest, RequestError>
     all_tools.append(&mut extra_tools);
     let tools = map_tools(all_tools)?;
     let tool_choice = map_tool_choice(request.tool_choice, &tools)?;
+    let tools_enabled = !tools.is_empty()
+        && tool_choice
+            .as_ref()
+            .and_then(|choice| choice.get("type"))
+            .and_then(Value::as_str)
+            != Some("none");
+    if tools_enabled {
+        system.get_or_insert_with(Vec::new).push(SystemMessage {
+            text: TOOL_TURN_COMPLETION_POLICY.to_string(),
+        });
+    }
     let (thinking, output_config) = map_reasoning(&request.model, request.reasoning)?;
     let thinking_enabled = thinking.as_ref().is_some_and(Thinking::is_enabled);
 
@@ -1121,12 +1133,18 @@ fn recover_leaked_function_call(
     tool_name_map: &HashMap<String, String>,
 ) -> Option<CollectedCall> {
     const MARKER: &str = "to=functions.";
-    const MAX_PREFIX_LEN: usize = 256;
+    const MAX_PREFIX_LEN: usize = 1024;
     const MAX_ARGUMENT_GAP: usize = 256;
 
     let marker_start = text.find(MARKER)?;
+    let prefix = &text[..marker_start];
+    // A leaked recipient can follow a short progress update, but it still starts on its own
+    // logical line. Reject prose such as "For example, to=functions..." on the same line.
+    let marker_line_prefix = prefix
+        .rsplit_once(['\n', '\r'])
+        .map_or(prefix, |(_, line)| line);
     if marker_start > MAX_PREFIX_LEN
-        || text[..marker_start]
+        || marker_line_prefix
             .chars()
             .any(|character| character.is_alphanumeric())
     {
@@ -1422,6 +1440,18 @@ impl ResponseStreamContext {
                 self.text.clear();
                 self.calls.push(call);
             }
+        }
+        if self.calls.is_empty()
+            && !self.available_tool_names.is_empty()
+            && !self.text.trim().is_empty()
+        {
+            tracing::warn!(
+                response_id = %self.response_id,
+                declared_tool_count = %self.available_tool_names.len(),
+                buffered_text_len = %self.text.len(),
+                leaked_tool_marker_present = self.text.contains("to=functions."),
+                "Upstream completed a text-only turn while function tools were available"
+            );
         }
 
         let (elapsed_ms, ttfb_ms, ttfc_ms, since_last_content_ms) = self.diag_fields();
@@ -1813,6 +1843,38 @@ mod tests {
     }
 
     #[test]
+    fn adds_completion_policy_when_function_tools_are_enabled() {
+        let mut req = request(json!("inspect it"));
+        req.tools = serde_json::from_value(json!([{
+            "type": "function",
+            "name": "inspect",
+            "parameters": {"type": "object", "properties": {}}
+        }]))
+        .unwrap();
+
+        let mapped = map_request(req).unwrap();
+        let system = mapped.messages.system.unwrap();
+
+        assert_eq!(system.last().unwrap().text, TOOL_TURN_COMPLETION_POLICY);
+    }
+
+    #[test]
+    fn does_not_add_completion_policy_when_tools_are_disabled() {
+        let mut req = request(json!("answer directly"));
+        req.tools = serde_json::from_value(json!([{
+            "type": "function",
+            "name": "inspect",
+            "parameters": {"type": "object", "properties": {}}
+        }]))
+        .unwrap();
+        req.tool_choice = Some(json!("none"));
+
+        let mapped = map_request(req).unwrap();
+
+        assert!(mapped.messages.system.is_none());
+    }
+
+    #[test]
     fn maps_input_image_data_url() {
         let mapped = map_request(request(json!([
             {"type": "message", "role": "user", "content": [
@@ -2111,6 +2173,19 @@ mod tests {
             serde_json::from_str::<Value>(&call.arguments).unwrap(),
             json!({"path": r"C:\Users\iaun\wechat_account_detail.png"})
         );
+    }
+
+    #[test]
+    fn recovers_leaked_tool_call_after_a_progress_update() {
+        let text = r#"I will inspect the image now.
+to=functions.view_image
+{"path":"image.png"}"#;
+        let tools = HashSet::from(["view_image".to_string()]);
+
+        let call = recover_leaked_function_call(text, &tools, &HashMap::new()).unwrap();
+
+        assert_eq!(call.name, "view_image");
+        assert_eq!(call.arguments, r#"{"path":"image.png"}"#);
     }
 
     #[test]
