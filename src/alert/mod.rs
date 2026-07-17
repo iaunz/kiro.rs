@@ -9,6 +9,7 @@ pub mod state;
 pub mod types;
 
 pub use handlers::{create_alert_router, AlertState as AlertRouterState};
+pub use poller::spawn_poller;
 
 use std::path::PathBuf;
 use std::sync::Arc;

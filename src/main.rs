@@ -151,7 +151,7 @@ async fn main() {
         api_url: config.count_tokens_api_url.clone(),
         api_key: config.count_tokens_api_key.clone(),
         auth_type: config.count_tokens_auth_type.clone(),
-        proxy: proxy_config,
+        proxy: proxy_config.clone(),
         tls_backend: config.tls_backend,
     });
 
@@ -183,10 +183,30 @@ async fn main() {
             // 创建 Admin UI 路由
             let admin_ui_app = admin_ui::create_admin_ui_router();
 
+            // 构建 Credit 预警服务
+            let smtp_settings = crate::alert::smtp_settings::SmtpSettings::from_env();
+            let smtp_configured = smtp_settings.is_some();
+            let alert_service = std::sync::Arc::new(alert::AlertService::new(
+                token_manager.clone(),
+                token_manager.cache_dir(),
+                proxy_config.clone(),
+                config.tls_backend,
+                smtp_settings,
+            ));
+            alert::spawn_poller(alert_service.clone());
+            let alert_state = alert::AlertRouterState {
+                admin_api_key: admin_key.clone(),
+                service: alert_service,
+                smtp_configured,
+            };
+            let alert_app = alert::create_alert_router(alert_state);
+
             tracing::info!("Admin API 已启用");
             tracing::info!("Admin UI 已启用: /admin");
+            tracing::info!("Credit 预警 API 已启用: /api/admin/alerts");
             anthropic_app
                 .nest("/api/admin", admin_app)
+                .nest("/api/admin/alerts", alert_app)
                 .nest("/admin", admin_ui_app)
         }
     } else {
@@ -210,6 +230,9 @@ async fn main() {
         tracing::info!("  POST /api/admin/credentials/:index/priority");
         tracing::info!("  POST /api/admin/credentials/:index/reset");
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
+        tracing::info!("  GET  /api/admin/alerts/config");
+        tracing::info!("  PUT  /api/admin/alerts/config");
+        tracing::info!("  GET  /api/admin/alerts/status");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
     }
