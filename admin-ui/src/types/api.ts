@@ -126,3 +126,49 @@ export interface SsoSessionResponse {
   email?: string
   error?: string
 }
+
+// ============ Credit 预警 ============
+
+export type AlertChannelKind = 'telegram' | 'email'
+
+export interface AlertChannelResponse {
+  id: string
+  kind: AlertChannelKind
+  enabled: boolean
+  name?: string
+  maskedBotToken?: string
+  chatId?: string
+  to?: string
+}
+
+export interface AlertConfigResponse {
+  enabled: boolean
+  thresholdRemaining: number
+  pollIntervalSecs: number
+  subjectPrefix?: string
+  channels: AlertChannelResponse[]
+  smtpConfigured: boolean
+}
+
+export interface UpdateAlertConfigRequest {
+  enabled?: boolean
+  thresholdRemaining?: number
+  pollIntervalSecs?: number
+  subjectPrefix?: string
+}
+
+export interface AlertChannelRequest {
+  kind: AlertChannelKind
+  enabled?: boolean
+  name?: string
+  botToken?: string
+  chatId?: string
+  to?: string
+}
+
+export interface AlertStatusResponse {
+  fired: boolean
+  lastTotalRemaining?: number
+  lastEvaluatedAt?: number
+  lastThreshold?: number
+}
