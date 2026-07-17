@@ -17,7 +17,7 @@ use crate::http_client::ProxyConfig;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 
-use config::AlertConfig;
+use config::{AlertChannel, AlertConfig};
 use notify::{build_channels, deliver_all, DeliveryResult};
 use smtp_settings::SmtpSettings;
 use state::{decide, fingerprint, AlertState, Decision};
@@ -90,6 +90,91 @@ impl AlertService {
                 tracing::warn!("保存 alert 状态失败: {}", e);
             }
         }
+    }
+
+    pub const MASK_PLACEHOLDER: &'static str = "__unchanged__";
+
+    fn persist_config(&self) {
+        if let Some(path) = &self.config_path {
+            let snap = self.config.lock().clone();
+            if let Err(e) = snap.save(path) {
+                tracing::warn!("保存 alert 配置失败: {}", e);
+            }
+        }
+    }
+
+    /// 合并被脱敏的密钥字段（占位符表示未改动，保留原值）
+    pub fn merge_channel_secrets(mut incoming: AlertChannel, original: &AlertChannel) -> AlertChannel {
+        if incoming.bot_token.as_deref() == Some(Self::MASK_PLACEHOLDER) {
+            incoming.bot_token = original.bot_token.clone();
+        }
+        incoming
+    }
+
+    pub fn update_config(
+        &self,
+        enabled: Option<bool>,
+        threshold: Option<f64>,
+        poll_interval_secs: Option<u64>,
+        subject_prefix: Option<Option<String>>,
+    ) -> AlertConfig {
+        {
+            let mut cfg = self.config.lock();
+            if let Some(v) = enabled {
+                cfg.enabled = v;
+            }
+            if let Some(v) = threshold {
+                cfg.threshold_remaining = v;
+            }
+            if let Some(v) = poll_interval_secs {
+                cfg.poll_interval_secs = v;
+            }
+            if let Some(v) = subject_prefix {
+                cfg.subject_prefix = v.filter(|s| !s.trim().is_empty());
+            }
+        }
+        self.persist_config();
+        self.config_snapshot()
+    }
+
+    pub fn add_channel(&self, mut ch: AlertChannel) -> AlertChannel {
+        if ch.id.trim().is_empty() {
+            ch.id = uuid::Uuid::new_v4().to_string();
+        }
+        self.config.lock().channels.push(ch.clone());
+        self.persist_config();
+        ch
+    }
+
+    pub fn update_channel(&self, id: &str, incoming: AlertChannel) -> anyhow::Result<AlertChannel> {
+        let mut cfg = self.config.lock();
+        let pos = cfg
+            .channels
+            .iter()
+            .position(|c| c.id == id)
+            .ok_or_else(|| anyhow::anyhow!("渠道不存在: {}", id))?;
+        let mut merged = Self::merge_channel_secrets(incoming, &cfg.channels[pos]);
+        merged.id = id.to_string(); // 保留原 id
+        cfg.channels[pos] = merged.clone();
+        drop(cfg);
+        self.persist_config();
+        Ok(merged)
+    }
+
+    pub fn delete_channel(&self, id: &str) -> anyhow::Result<()> {
+        let mut cfg = self.config.lock();
+        let before = cfg.channels.len();
+        cfg.channels.retain(|c| c.id != id);
+        if cfg.channels.len() == before {
+            anyhow::bail!("渠道不存在: {}", id);
+        }
+        drop(cfg);
+        self.persist_config();
+        Ok(())
+    }
+
+    pub async fn evaluate_now(&self) {
+        self.evaluate_once().await;
     }
 
     /// 只计算总额与计数（不发送、不改状态）
@@ -309,5 +394,40 @@ mod tests {
         let (subject, _) = AlertService::build_message_parts(&cfg, &summary);
         assert!(!subject.contains("  ")); // 无多余双空格
         assert!(subject.contains("Kiro Credit 预警"));
+    }
+
+    #[test]
+    fn test_merge_masked_token_keeps_original() {
+        // 抽出的纯函数：传入新渠道与原渠道，合并被脱敏的字段
+        let original = crate::alert::config::AlertChannel {
+            id: "1".into(),
+            kind: crate::alert::config::ChannelKind::Telegram,
+            enabled: true,
+            name: None,
+            bot_token: Some("REAL-TOKEN".into()),
+            chat_id: Some("c".into()),
+            to: None,
+        };
+        let mut incoming = original.clone();
+        incoming.bot_token = Some(AlertService::MASK_PLACEHOLDER.to_string());
+        let merged = AlertService::merge_channel_secrets(incoming, &original);
+        assert_eq!(merged.bot_token.as_deref(), Some("REAL-TOKEN"));
+    }
+
+    #[test]
+    fn test_merge_real_token_overrides() {
+        let original = crate::alert::config::AlertChannel {
+            id: "1".into(),
+            kind: crate::alert::config::ChannelKind::Telegram,
+            enabled: true,
+            name: None,
+            bot_token: Some("OLD".into()),
+            chat_id: Some("c".into()),
+            to: None,
+        };
+        let mut incoming = original.clone();
+        incoming.bot_token = Some("NEW".into());
+        let merged = AlertService::merge_channel_secrets(incoming, &original);
+        assert_eq!(merged.bot_token.as_deref(), Some("NEW"));
     }
 }
