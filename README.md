@@ -43,6 +43,7 @@
 - **WebSearch**: 内置 WebSearch 工具转换逻辑
 - **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
 - **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
+- **Credit 预警**: 后台定时汇总所有凭据的剩余额度，低于阈值时通过 Telegram / 邮件一次性告警
 - **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
 - **凭据级代理**: 支持为每个凭据单独配置 HTTP/SOCKS5 代理，优先级：凭据代理 > 全局代理 > 无代理
 
@@ -61,6 +62,7 @@
   - [代理配置](#代理配置)
   - [认证方式](#认证方式)
   - [环境变量](#环境变量)
+- [Credit 预警](#credit-预警)
 - [API 端点](#api-端点)
   - [标准端点 (/v1)](#标准端点-v1)
   - [Claude Code 兼容端点 (/cc/v1)](#claude-code-兼容端点-ccv1)
@@ -369,6 +371,40 @@ docker-compose up
 ```bash
 RUST_LOG=debug ./target/release/kiro-rs
 ```
+
+Credit 预警的 SMTP（邮件通知）连接参数也通过环境变量配置。仅当 `ALERT_SMTP_HOST`
+与 `ALERT_SMTP_FROM` 均已设置时，邮件渠道才会启用；否则邮件渠道会被跳过（Telegram 渠道不受影响）。
+
+| 变量 | 必填 | 说明 |
+| --- | --- | --- |
+| `ALERT_SMTP_HOST` | 是 | SMTP 服务器地址；缺失则邮件渠道禁用 |
+| `ALERT_SMTP_FROM` | 是 | 发件人地址；缺失则邮件渠道禁用 |
+| `ALERT_SMTP_PORT` | 否 | 端口；缺省按 TLS 推断（`implicit`=465，其它=587）|
+| `ALERT_SMTP_USERNAME` | 否 | SMTP 认证用户名 |
+| `ALERT_SMTP_PASSWORD` | 否 | SMTP 认证密码 |
+| `ALERT_SMTP_TLS` | 否 | `starttls`（默认）/ `implicit` / `none` |
+
+> 说明：Telegram 通知会复用 `config.json` 的 `proxyUrl` 出站代理；SMTP 邮件为直连，不走代理。
+
+## Credit 预警
+
+在启用 Admin API（配置了 `adminApiKey`）后，系统会在后台定时轮询所有凭据的剩余额度，
+汇总后与用户设定的阈值比较，低于阈值时通过通知渠道告警。
+
+- **数据来源**：复用各凭据的 `getUsageLimits` 查询，汇总「已启用且可上报（social / IdC）」
+  凭据的剩余额度；API Key 凭据与已禁用凭据不计入。查询失败的凭据本轮从汇总中排除，
+  若本轮全部失败则跳过评估。
+- **通知渠道**：支持多个 Telegram bot 与多个邮件收件人，在 Web 管理界面配置，
+  持久化到缓存目录下的 `alert_config.json`。Telegram 的 `botToken` 在读取时会脱敏返回，
+  不会明文回传前端。SMTP 连接参数见上文[环境变量](#环境变量)。
+- **阈值与轮询**：阈值、轮询间隔、主题前缀均在 Web 管理界面设置。轮询在基础间隔上叠加
+  5–10 分钟随机抖动，避免固定节拍冲击上游。
+- **单次告警语义**：低于阈值时只告警一次。以下任一情况会重新「布防」（使其可再次告警）：
+  新增凭据、总剩余恢复到阈值 + 迟滞裕度以上、用户修改阈值。运行状态持久化到
+  `alert_state.json`，重启不会重复告警。
+- **主题前缀**：可为告警主题设置前缀（如 `PROD-东京`），便于区分多个部署实例。
+
+> 提示：`POST /api/admin/alerts/test` 可向所有启用渠道发送测试消息（仅 API，未在界面暴露）。
 
 ## API 端点
 
