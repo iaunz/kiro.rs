@@ -1,5 +1,6 @@
 mod admin;
 mod admin_ui;
+mod alert;
 mod anthropic;
 mod common;
 mod http_client;
