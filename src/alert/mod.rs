@@ -48,6 +48,11 @@ pub struct AlertService {
     proxy: Option<ProxyConfig>,
     tls: TlsBackend,
     smtp: Option<Arc<SmtpSettings>>,
+    /// 评估单飞锁：串行化 evaluate_once，避免后台轮询与配置变更触发的
+    /// evaluate_now 并发进入 Fire 分支导致重复告警。
+    /// 必须用 tokio 异步 Mutex（而非 parking_lot），因为该守卫需跨越
+    /// 网络投递的 .await 点持有；持锁期间只可持有 tokio 锁。
+    eval_lock: tokio::sync::Mutex<()>,
 }
 
 impl AlertService {
@@ -77,6 +82,7 @@ impl AlertService {
             proxy,
             tls,
             smtp: smtp.map(Arc::new),
+            eval_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -282,6 +288,11 @@ impl AlertService {
 
     /// 核心：评估一轮并按需告警
     pub async fn evaluate_once(&self) {
+        // 单飞：整个评估过程串行执行。第二个调用者会等待第一个完成
+        // （含 fired = true 写入与状态持久化），随后看到 fired == true 而不再重复触发，
+        // 从而守住“仅告警一次”的保证。
+        let _eval_guard = self.eval_lock.lock().await;
+
         let cfg = self.config_snapshot();
         if !cfg.enabled {
             return;
@@ -434,5 +445,26 @@ mod tests {
         incoming.bot_token = Some("NEW".into());
         let merged = AlertService::merge_channel_secrets(incoming, &original);
         assert_eq!(merged.bot_token.as_deref(), Some("NEW"));
+    }
+
+    #[tokio::test]
+    async fn test_eval_lock_serializes_single_flight() {
+        // 单飞锁保证同一时刻只有一次评估进行：持锁期间第二个调用者无法进入，
+        // try_lock 必须返回 Err；释放后才允许下一轮评估。以此守住“仅告警一次”。
+        let cfg = crate::model::config::Config::default();
+        let tm = crate::kiro::token_manager::MultiTokenManager::new(cfg, vec![], None, None, false)
+            .expect("空凭据管理器应可构造");
+        let svc = AlertService::new(Arc::new(tm), None, None, TlsBackend::default(), None);
+
+        let guard = svc.eval_lock.lock().await;
+        assert!(
+            svc.eval_lock.try_lock().is_err(),
+            "持锁期间应互斥，第二次获取需失败"
+        );
+        drop(guard);
+        assert!(
+            svc.eval_lock.try_lock().is_ok(),
+            "释放后应可再次获取，允许下一轮评估"
+        );
     }
 }
