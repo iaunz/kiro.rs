@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod notify;
+pub mod poller;
 pub mod smtp_settings;
 pub mod state;
 
