@@ -67,7 +67,18 @@ pub struct UpdateConfigRequest {
     pub enabled: Option<bool>,
     pub threshold_remaining: Option<f64>,
     pub poll_interval_secs: Option<u64>,
-    pub subject_prefix: Option<String>,
+    // None=字段缺失(不改), Some(None)=显式置空(清空), Some(Some(x))=设置
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub subject_prefix: Option<Option<String>>,
+}
+
+/// 区分「字段缺失」(None) 与「显式置空」(Some(None))
+fn deserialize_double_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // 字段存在时（包括 null）都会进入这里；缺失时 serde(default) 给出 None
+    Ok(Some(Option::<String>::deserialize(deserializer)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,5 +123,18 @@ mod tests {
     fn test_mask_token() {
         assert_eq!(mask_token("1234567890:ABCDEFGH"), "123456...GH");
         assert_eq!(mask_token("short"), "***");
+    }
+
+    #[test]
+    fn test_update_config_subject_prefix_semantics() {
+        // 缺失字段 => None（不改）
+        let r: UpdateConfigRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(r.subject_prefix, None);
+        // 显式 null => Some(None)（清空）
+        let r: UpdateConfigRequest = serde_json::from_str(r#"{"subjectPrefix":null}"#).unwrap();
+        assert_eq!(r.subject_prefix, Some(None));
+        // 显式字符串 => Some(Some(..))（设置）
+        let r: UpdateConfigRequest = serde_json::from_str(r#"{"subjectPrefix":"PROD"}"#).unwrap();
+        assert_eq!(r.subject_prefix, Some(Some("PROD".to_string())));
     }
 }

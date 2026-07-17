@@ -55,12 +55,12 @@ async fn put_config(
     State(state): State<AlertState>,
     Json(req): Json<UpdateConfigRequest>,
 ) -> impl IntoResponse {
-    let subject_prefix = Some(req.subject_prefix); // Some(None)=清空, Some(Some(x))=设置
+    // req.subject_prefix 已是 Option<Option<String>>：None=不改, Some(None)=清空, Some(Some(x))=设置
     state.service.update_config(
         req.enabled,
         req.threshold_remaining,
         req.poll_interval_secs,
-        subject_prefix,
+        req.subject_prefix,
     );
     // 保存后立即重评估（阈值变化即时生效），不阻塞响应
     let svc = state.service.clone();
