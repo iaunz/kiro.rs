@@ -29,6 +29,7 @@ pub struct EvalSummary {
     pub skipped_error: usize,
     pub skipped_unreportable: usize,
     pub all_failed: bool,
+    pub reportable_ids: Vec<u64>,
 }
 
 /// 预警服务（协调配置、状态、评估、通知）
@@ -131,6 +132,7 @@ impl AlertService {
             skipped_error,
             skipped_unreportable,
             all_failed,
+            reportable_ids: reportable,
         }
     }
 
@@ -200,15 +202,14 @@ impl AlertService {
             return;
         }
 
-        // 重新收集 reportable 指纹（evaluate_summary 未返回 id 列表，这里独立计算）
-        let snap = self.token_manager.snapshot();
-        let reportable_ids: Vec<u64> = snap
-            .entries
-            .iter()
-            .filter(|e| !e.disabled && e.auth_method.as_deref() != Some("api_key"))
-            .map(|e| e.id)
-            .collect();
-        let fingerprint_now = fingerprint(&reportable_ids);
+        // 无可上报凭据，跳过评估（避免总额为 0 触发误报）
+        if summary.reportable_ids.is_empty() {
+            tracing::debug!("无可上报凭据，跳过本轮预警评估");
+            return;
+        }
+
+        // 指纹与求和使用同一凭据集，避免中途凭据变动导致不一致
+        let fingerprint_now = fingerprint(&summary.reportable_ids);
 
         let decision = {
             let state = self.state.lock();
@@ -277,13 +278,14 @@ mod tests {
             skipped_error: 1,
             skipped_unreportable: 2,
             all_failed: false,
+            reportable_ids: vec![1, 2, 3],
         };
         let (subject, body) = AlertService::build_message_parts(&cfg, &summary);
         assert!(subject.contains("PROD-东京"));
         assert!(subject.contains("842"));
         assert!(body.contains("1000"));
-        assert!(body.contains("3")); // included
-        assert!(body.contains("跳过") || body.contains("1")); // skipped_error
+        assert!(body.contains("纳入 3 个")); // included
+        assert!(body.contains("跳过 1 个（查询失败）")); // skipped_error
     }
 
     #[test]
@@ -301,6 +303,7 @@ mod tests {
             skipped_error: 0,
             skipped_unreportable: 0,
             all_failed: false,
+            reportable_ids: vec![1],
         };
         let (subject, _) = AlertService::build_message_parts(&cfg, &summary);
         assert!(!subject.contains("  ")); // 无多余双空格
