@@ -475,7 +475,10 @@ Credit 预警的 SMTP（邮件通知）连接参数也通过环境变量配置�
 |----------------|-----------|
 | `*sonnet*` | `claude-sonnet-4.5` |
 | `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
-| `*opus*`（其他） | `claude-opus-4.6` |
+| `*opus*`（含 4.6/4-6） | `claude-opus-4.6` |
+| `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
+| `*opus*`（含 4.8/4-8） | `claude-opus-4.8` |
+| `*opus*`（含 5） | `claude-opus-5` |
 | `*haiku*` | `claude-haiku-4.5` |
 | `gpt-5.6-sol` | `gpt-5.6-sol` |
 | `gpt-5.6-terra` | `gpt-5.6-terra` |
