@@ -10,6 +10,16 @@ use std::path::Path;
 use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
 
+/// BuilderID 账号的占位符 profileArn
+///
+/// BuilderID 没有可解析的真实 profile，官方 IDE 就是原样发这个占位符。
+pub const BUILDER_ID_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+
+/// Social 登录（Github / Google）共用的 profileArn
+pub const SOCIAL_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+
 /// Kiro OAuth 凭证
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -272,6 +282,47 @@ impl KiroCredentials {
                 .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
                 .unwrap_or(false)
     }
+
+    /// 是否为 Social 登录（Github / Google）
+    fn is_social_login(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("social"))
+            .unwrap_or(false)
+    }
+
+    /// 凭据缺少显式 profileArn 时应使用的默认 ARN：
+    /// Social 登录用共享 Social ARN，其余（BuilderID / IdC）用 BuilderID 占位符。
+    fn default_profile_arn(&self) -> &'static str {
+        if self.is_social_login() {
+            SOCIAL_PROFILE_ARN
+        } else {
+            BUILDER_ID_PROFILE_ARN
+        }
+    }
+
+    /// 返回请求应发送的 profileArn。
+    ///
+    /// 上游已把用量类接口的 profileArn 改为必填：不带会被拒（旧版 UA 回 403
+    /// "User is not authorized to make this call."，新版 UA 回 400 "Invalid profileArn."）。
+    ///
+    /// - 已有显式 profileArn（真实 ARN / Social ARN / BuilderID 占位符）→ 原样返回。
+    ///   BuilderID 恰恰要原样带上占位符才回 200，剥掉会被拒；
+    /// - 尚未填充 → 按登录方式推断默认 ARN（Social → Social ARN，其余 → BuilderID 占位符）；
+    /// - API Key 凭据无 profileArn 概念 → 返回 `None`，靠 `tokentype: API_KEY` 头通过。
+    ///
+    /// 命名沿用上游（那边流式端点也走这个方法），本项目的流式链路在
+    /// `kiro::endpoint::ide` 里直接注入 `profile_arn`，未随本次修复改动。
+    pub fn streaming_profile_arn(&self) -> Option<String> {
+        if self.is_api_key_credential() {
+            return None;
+        }
+        Some(
+            self.profile_arn
+                .clone()
+                .unwrap_or_else(|| self.default_profile_arn().to_string()),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +340,86 @@ impl KiroCredentials {
 mod tests {
     use super::*;
     use crate::model::config::Config;
+
+    // ============ streaming_profile_arn 测试 ============
+
+    /// 已回填真实 ARN 的凭据原样返回，不做任何剥离。
+    #[test]
+    fn test_streaming_profile_arn_keeps_resolved_arn() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:1234:profile/REAL".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            credentials.streaming_profile_arn().as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:1234:profile/REAL")
+        );
+    }
+
+    /// BuilderID 占位符必须原样保留：剥掉它上游会拒绝请求。
+    #[test]
+    fn test_streaming_profile_arn_keeps_builder_id_placeholder() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: Some(BUILDER_ID_PROFILE_ARN.to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            credentials.streaming_profile_arn().as_deref(),
+            Some(BUILDER_ID_PROFILE_ARN)
+        );
+    }
+
+    /// 未填充时按登录方式推断默认 ARN。
+    #[test]
+    fn test_streaming_profile_arn_falls_back_by_auth_method() {
+        let social = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            profile_arn: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            social.streaming_profile_arn().as_deref(),
+            Some(SOCIAL_PROFILE_ARN)
+        );
+
+        let idc = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            idc.streaming_profile_arn().as_deref(),
+            Some(BUILDER_ID_PROFILE_ARN)
+        );
+
+        // auth_method 缺失时按非 Social 处理
+        let unknown = KiroCredentials::default();
+        assert_eq!(
+            unknown.streaming_profile_arn().as_deref(),
+            Some(BUILDER_ID_PROFILE_ARN)
+        );
+    }
+
+    /// API Key 凭据没有 profileArn 概念，返回 None。
+    #[test]
+    fn test_streaming_profile_arn_none_for_api_key() {
+        let by_key = KiroCredentials {
+            kiro_api_key: Some("ksk_test".to_string()),
+            profile_arn: Some("arn:aws:test".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(by_key.streaming_profile_arn(), None);
+
+        let by_method = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(by_method.streaming_profile_arn(), None);
+    }
 
     #[test]
     fn test_from_json() {
