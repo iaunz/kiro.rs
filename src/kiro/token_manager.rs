@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::kiro_version::{USAGE_API_AWS_SDK_VERSION, USAGE_API_KIRO_VERSION};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -319,6 +320,47 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// 构造用量类 REST 接口（getUsageLimits）的 UA 对：`(user-agent, x-amz-user-agent)`。
+///
+/// 版本号被上游当作准入条件，固定用 [`USAGE_API_KIRO_VERSION`] +
+/// [`USAGE_API_AWS_SDK_VERSION`]，不跟 `config.kiro_version` 走——后者服务于推理链路，
+/// 两者版本不必一致。详见 [`USAGE_API_KIRO_VERSION`] 的说明。
+fn usage_api_user_agents(credentials: &KiroCredentials, config: &Config) -> (String, String) {
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let sdk = USAGE_API_AWS_SDK_VERSION;
+    let kiro_version = USAGE_API_KIRO_VERSION;
+    let user_agent = format!(
+        "aws-sdk-js/{} ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#{} m/N,E KiroIDE-{}-{}",
+        sdk, config.system_version, config.node_version, sdk, kiro_version, machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/{} KiroIDE-{}-{}", sdk, kiro_version, machine_id);
+    (user_agent, amz_user_agent)
+}
+
+/// 用量类 REST 接口的 `profileArn` 查询参数（含前导 `&`），不需要时为空串。
+///
+/// 上游已把 profileArn 改为必填：不带会被拒（旧版 UA 回 403 "User is not authorized
+/// to make this call."，新版 UA 回 400 "Invalid profileArn."）。取值用
+/// [`KiroCredentials::streaming_profile_arn`]，它对 BuilderID 会补上占位符 ARN
+/// ——BuilderID 恰恰要原样带上占位符才回 200。
+///
+/// API Key 凭据没有 profileArn 概念，该方法返回 `None` 时不发该参数，
+/// 靠 `tokentype: API_KEY` 头通过。
+fn profile_arn_query(credentials: &KiroCredentials) -> String {
+    match credentials.streaming_profile_arn() {
+        Some(arn) => format!("&profileArn={}", urlencoding::encode(&arn)),
+        None => String::new(),
+    }
+}
+
+fn usage_limits_url(host: &str, credentials: &KiroCredentials) -> String {
+    format!(
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST{}",
+        host,
+        profile_arn_query(credentials)
+    )
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -331,31 +373,8 @@ pub(crate) async fn get_usage_limits(
     // 优先级：凭据.api_region > config.api_region > config.region
     let region = credentials.effective_api_region(config);
     let host = format!("q.{}.amazonaws.com", region);
-    let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
-
-    // 构建 URL
-    let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
-        host
-    );
-
-    // profileArn 是可选的
-    if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
-    }
-
-    // 构建 User-Agent headers
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!(
-        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
-        kiro_version, machine_id
-    );
+    let url = usage_limits_url(&host, credentials);
+    let (user_agent, amz_user_agent) = usage_api_user_agents(credentials, config);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
@@ -1934,6 +1953,7 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::model::credentials::{BUILDER_ID_PROFILE_ARN, SOCIAL_PROFILE_ARN};
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
@@ -2442,6 +2462,131 @@ mod tests {
             err
         );
         assert_eq!(manager.available_count(), 0);
+    }
+
+    // ============ 用量接口 UA 与 profileArn 测试 ============
+
+    const TEST_USAGE_HOST: &str = "q.us-east-1.amazonaws.com";
+
+    /// 真实 ARN（Enterprise/IdC 回填的）必须原样带上：上游已把 profileArn 改为必填。
+    #[test]
+    fn test_usage_limits_url_sends_resolved_profile_arn() {
+        let credentials = KiroCredentials {
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            usage_limits_url(TEST_USAGE_HOST, &credentials),
+            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123"
+        );
+    }
+
+    /// BuilderID 账号没有真实 profile，必须原样发占位符 ARN 才回 200。
+    #[test]
+    fn test_usage_limits_url_sends_builder_id_placeholder() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: Some(BUILDER_ID_PROFILE_ARN.to_string()),
+            ..Default::default()
+        };
+
+        let url = usage_limits_url(TEST_USAGE_HOST, &credentials);
+        assert!(
+            url.contains(&format!(
+                "profileArn={}",
+                urlencoding::encode(BUILDER_ID_PROFILE_ARN)
+            )),
+            "BuilderID 占位符必须原样发送，实际 URL: {url}"
+        );
+    }
+
+    /// IdC 凭据尚未回填 profileArn 时补 BuilderID 占位符，避免新 UA 下 400。
+    #[test]
+    fn test_usage_limits_url_fills_builder_id_arn_when_absent() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: None,
+            ..Default::default()
+        };
+
+        let url = usage_limits_url(TEST_USAGE_HOST, &credentials);
+        assert!(
+            url.contains(&format!(
+                "profileArn={}",
+                urlencoding::encode(BUILDER_ID_PROFILE_ARN)
+            )),
+            "缺失 profileArn 的 IdC 凭据应补 BuilderID 占位符，实际 URL: {url}"
+        );
+    }
+
+    /// 未显式配置 profileArn 的 Social 凭据按登录方式补 Social 共享 ARN。
+    #[test]
+    fn test_usage_limits_url_fills_social_arn_when_absent() {
+        let credentials = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            profile_arn: None,
+            ..Default::default()
+        };
+
+        let url = usage_limits_url(TEST_USAGE_HOST, &credentials);
+        assert!(
+            url.contains(&format!(
+                "profileArn={}",
+                urlencoding::encode(SOCIAL_PROFILE_ARN)
+            )),
+            "Social 凭据应补共享 ARN，实际 URL: {url}"
+        );
+    }
+
+    /// API Key 凭据没有 profileArn 概念，靠 `tokentype: API_KEY` 头通过，不应带该参数。
+    #[test]
+    fn test_usage_limits_url_omits_arn_for_api_key() {
+        let credentials = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_test".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            usage_limits_url(TEST_USAGE_HOST, &credentials),
+            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST"
+        );
+    }
+
+    /// 用量接口的 UA 版本号被上游当准入条件，必须锁定，不跟 config.kiro_version 漂移。
+    #[test]
+    fn test_usage_api_user_agent_pins_version() {
+        let config = Config::default();
+        let credentials = KiroCredentials::default();
+        let (ua, amz_ua) = usage_api_user_agents(&credentials, &config);
+
+        for s in [&ua, &amz_ua] {
+            assert!(
+                s.contains(&format!("KiroIDE-{}", USAGE_API_KIRO_VERSION)),
+                "UA 应固定 KiroIDE 版本: {s}"
+            );
+            assert!(
+                s.contains(&format!("aws-sdk-js/{}", USAGE_API_AWS_SDK_VERSION)),
+                "UA 应固定 SDK 版本: {s}"
+            );
+        }
+
+        // 推理链路的版本独立演进，用量接口不应跟着它走
+        assert!(
+            !ua.contains(&format!("KiroIDE-{}-", config.kiro_version))
+                || config.kiro_version == USAGE_API_KIRO_VERSION,
+            "用量接口 UA 不应使用 config.kiro_version: {ua}"
+        );
+        assert!(
+            ua.contains(&format!(
+                "api/codewhispererruntime#{}",
+                USAGE_API_AWS_SDK_VERSION
+            )),
+            "UA 的 runtime 版本应与 SDK 版本一致: {ua}"
+        );
     }
 
     // ============ 凭据级 Region 优先级测试 ============
