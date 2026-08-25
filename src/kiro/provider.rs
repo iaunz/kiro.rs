@@ -15,7 +15,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -43,6 +43,13 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
+    /// 已尝试过 profileArn 解析的凭据 ID（进程内去重）
+    ///
+    /// 只在拿到**上游确定结果**后才写入：解析成功后凭据已有真实 ARN，
+    /// `streaming_profile_arn()` 直接命中不会再进来；确定无 profile 的账号
+    /// （纯 BuilderID）靠这个集合避免每次请求都白跑一次往返。
+    /// 网络抖动等不确定失败不写入，留待下次请求重试。
+    profile_resolution_attempted: Mutex<HashSet<u64>>,
 }
 
 impl KiroProvider {
@@ -78,6 +85,60 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint,
+            profile_resolution_attempted: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// 在发起请求前，确保 Enterprise / IdC 账号的真实 profileArn 已解析并写入 `ctx`。
+    ///
+    /// 流式端点强制要求 profileArn：不带会被上游以
+    /// `403 {"message":"User is not authorized to make this call."}` 拒绝。
+    /// Enterprise / IdC 账号还必须是**真实** ARN —— BuilderID 占位符会因身份不匹配被拒，
+    /// 而真实 ARN 既不在 OIDC 刷新响应里，也不在 SSO 导入结果里，只能查
+    /// `ListAvailableProfiles`。
+    ///
+    /// 仅对「OAuth 凭据 + profileArn 缺失或仍是占位符」触发一次查询（进程内去重）：
+    /// - 命中真实 ARN → 写回并持久化，之后 `streaming_profile_arn()` 直接命中；
+    /// - 上游确定无 profile（纯 BuilderID）→ 标记已尝试，回退占位符；
+    /// - 查询失败 → **不标记**，本次按原值继续，下次请求再试。
+    async fn ensure_profile_arn(&self, ctx: &mut CallContext) {
+        use crate::kiro::model::credentials::is_placeholder_profile_arn;
+
+        if ctx.credentials.is_api_key_credential() {
+            return;
+        }
+        let needs = match ctx.credentials.profile_arn.as_deref() {
+            None => true,
+            Some(arn) => is_placeholder_profile_arn(arn),
+        };
+        if !needs {
+            return;
+        }
+        if self.profile_resolution_attempted.lock().contains(&ctx.id) {
+            return;
+        }
+
+        match self
+            .token_manager
+            .resolve_profile_arn_for(ctx.id, &ctx.token)
+            .await
+        {
+            Ok(Some(arn)) => {
+                ctx.credentials.profile_arn = Some(arn);
+                self.profile_resolution_attempted.lock().insert(ctx.id);
+            }
+            Ok(None) => {
+                // 上游确认该账号无 Enterprise profile：标记已尝试，后续回退占位符
+                self.profile_resolution_attempted.lock().insert(ctx.id);
+            }
+            Err(e) => {
+                // 网络/瞬态错误：不标记，下次请求再试；本次按原 profileArn 继续
+                tracing::warn!(
+                    "凭据 #{} 解析真实 profileArn 失败（按原 profileArn 继续）: {}",
+                    ctx.id,
+                    e
+                );
+            }
         }
     }
 
@@ -134,13 +195,16 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let mut ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+
+            // MCP 的 x-amzn-kiro-profile-arn 头同样需要真实 ARN
+            self.ensure_profile_arn(&mut ctx).await;
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -292,13 +356,16 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let mut ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+
+            // Enterprise / IdC 账号需要真实 profileArn，流式端点强制要求
+            self.ensure_profile_arn(&mut ctx).await;
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);

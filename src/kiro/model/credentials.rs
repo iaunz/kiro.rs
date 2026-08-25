@@ -126,6 +126,14 @@ fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+/// 判断给定 profileArn 是否为 BuilderID 占位符（非真实可用的 profile）。
+///
+/// Enterprise / IdC 账号必须换成 `ListAvailableProfiles` 解析出的真实 ARN；
+/// 占位符对它们等同于「还没解析过」。
+pub fn is_placeholder_profile_arn(arn: &str) -> bool {
+    arn == BUILDER_ID_PROFILE_ARN
+}
+
 fn canonicalize_auth_method_value(value: &str) -> &str {
     if value.eq_ignore_ascii_case("builder-id") || value.eq_ignore_ascii_case("iam") {
         "idc"

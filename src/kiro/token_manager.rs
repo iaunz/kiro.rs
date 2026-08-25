@@ -19,6 +19,7 @@ use std::time::{Duration as StdDuration, Instant};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::kiro_version::{USAGE_API_AWS_SDK_VERSION, USAGE_API_KIRO_VERSION};
 use crate::kiro::machine_id;
+use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
@@ -318,6 +319,128 @@ async fn refresh_idc_token(
     }
 
     Ok(new_credentials)
+}
+
+/// 官方 Kiro 用量 / profile 类接口仅在 `us-east-1` 与 `eu-central-1` 两个端点提供服务。
+///
+/// 依据凭据的 SSO 区域选择主端点，并返回另一个端点作为回退候选：
+/// - `eu-central-1` 或任何 `eu-*` 区域 → 主端点 `eu-central-1`
+/// - 其余区域 → 主端点 `us-east-1`
+///
+/// 这样导入的 Enterprise / IdC 账号即使 SSO 区域不是 `us-east-1`（例如
+/// `ap-southeast-1`），也能命中正确的端点。
+fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
+    let primary_eu = sso_region == "eu-central-1" || sso_region.starts_with("eu-");
+    if primary_eu {
+        ["eu-central-1", "us-east-1"]
+    } else {
+        ["us-east-1", "eu-central-1"]
+    }
+}
+
+/// 上游是否明确表示「该账号类型没有 profile 概念」。
+///
+/// BuilderID 账号调 `ListAvailableProfiles` 会稳定收到：
+/// `403 {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException",
+///       "message":"AWS Builder ID is not supported for this operation."}`
+///
+/// 这是**账号属性**（BuilderID 天生无 profile），不是查询故障 —— 重试一万次也是同样
+/// 结果，不该让调用方反复重查。必须与网络抖动、限流、5xx 区分开：那些重试有意义。
+///
+/// 刻意只认这一种确定性否定，不采用「非 200 一律当作没有 profile」的粗口径：后者会
+/// 让 Enterprise 账号在一次网络抖动后错用占位符 ARN，请求全数被拒。
+fn is_no_profile_concept_response(status: u16, body: &str) -> bool {
+    status == 403 && body.contains("Builder ID is not supported for this operation")
+}
+
+/// 获取该凭据可用的真实 profileArn 列表（`ListAvailableProfiles`）。
+///
+/// Enterprise / IAM Identity Center (IdC) 账号必须用真实 profileArn 调用流式端点；
+/// 该 ARN 既不是 BuilderID 占位符，也**不在 OIDC 刷新响应里返回**（AWS SSO OIDC 的
+/// `/token` 只给 access_token / refresh_token / expires_in，没有 profile 概念），
+/// 只能通过本接口获取。
+///
+/// 上游接口（AWS JSON 1.0，**与用量类的 REST GET 不同**）：
+/// `POST https://q.{region}.amazonaws.com/`，请求头
+/// `x-amz-target: AmazonCodeWhispererService.ListAvailableProfiles`，
+/// `Content-Type: application/x-amz-json-1.0`，Body `{"maxResults":N}`。
+///
+/// 仅在 `us-east-1` / `eu-central-1` 提供服务，依据凭据 SSO 区域选主端点，
+/// 主端点未返回 profile 时回退到另一个端点。
+pub(crate) async fn list_available_profiles(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ListAvailableProfilesResponse> {
+    tracing::debug!("正在获取可用 profile 列表...");
+
+    let sso_region = credentials.effective_auth_region(config);
+    let candidates = rest_api_region_candidates(sso_region);
+    let (user_agent, amz_user_agent) = usage_api_user_agents(credentials, config);
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    let mut last_error: Option<String> = None;
+    let mut empty_seen = false;
+    for region in candidates.iter() {
+        let host = format!("q.{}.amazonaws.com", region);
+        let url = format!("https://{}/", host);
+
+        let mut request = client
+            .post(&url)
+            .header("content-type", "application/x-amz-json-1.0")
+            .header(
+                "x-amz-target",
+                "AmazonCodeWhispererService.ListAvailableProfiles",
+            )
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Connection", "close")
+            .body(r#"{"maxResults":10}"#);
+
+        if credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        }
+
+        let response = request.send().await?;
+        let status = response.status();
+
+        if status.is_success() {
+            let data: ListAvailableProfilesResponse = response.json().await?;
+            // 该区域无 profile 时尝试另一个区域端点（账号可能在 eu-central-1）
+            if data.first_arn().is_none() {
+                empty_seen = true;
+                continue;
+            }
+            return Ok(data);
+        }
+
+        let body_text = response.text().await.unwrap_or_default();
+        // 上游明确回「BuilderID 不支持此操作」= 该账号没有 profile 概念，是账号属性而非
+        // 查询故障。视同「成功但为空」，让调用方标记已尝试、回退占位符，不再每请求重查。
+        if is_no_profile_concept_response(status.as_u16(), &body_text) {
+            empty_seen = true;
+            continue;
+        }
+        last_error = Some(format!("{} {}", status, body_text));
+        // 403 等错误继续尝试下一个候选端点
+    }
+
+    // 没有任何端点返回 profile：若至少有一次「成功但为空」或确定性否定，
+    // 视为该账号无 Enterprise profile（BuilderID 等），返回空让调用方回退占位符。
+    if empty_seen {
+        return Ok(ListAvailableProfilesResponse::default());
+    }
+
+    bail!(
+        "获取可用 profile 失败: {}",
+        last_error.unwrap_or_else(|| "无可用端点".to_string())
+    );
 }
 
 /// 构造用量类 REST 接口（getUsageLimits）的 UA 对：`(user-agent, x-amz-user-agent)`。
@@ -1548,8 +1671,71 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 获取指定凭据的使用额度（Admin API）
-    pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
+    /// 解析并回填该凭据的真实 profileArn（`ListAvailableProfiles`）。
+    ///
+    /// 返回值语义：
+    /// - `Ok(Some(arn))` —— 已有真实 ARN，或本次解析成功（成功时写回凭据并持久化）；
+    /// - `Ok(None)` —— 上游**确定**该账号没有 Enterprise profile（纯 BuilderID 等），
+    ///   或该凭据是 API Key。调用方应回退到占位符逻辑并标记已尝试，不再重查；
+    /// - `Err(_)` —— 查询失败（网络抖动 / 限流 / 5xx）。调用方**不应**标记已尝试，
+    ///   否则一次抖动会把 Enterprise 账号永久卡在占位符上。
+    pub async fn resolve_profile_arn_for(
+        &self,
+        id: u64,
+        token: &str,
+    ) -> anyhow::Result<Option<String>> {
+        use crate::kiro::model::credentials::is_placeholder_profile_arn;
+
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        // API Key 凭据没有 profileArn 概念
+        if credentials.is_api_key_credential() {
+            return Ok(None);
+        }
+
+        // 已有真实 ARN（含 Social 共享 ARN）→ 直接用，无需查询
+        if let Some(arn) = credentials.profile_arn.as_deref() {
+            if !is_placeholder_profile_arn(arn) {
+                return Ok(Some(arn.to_string()));
+            }
+        }
+
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let profiles =
+            list_available_profiles(&credentials, &self.config, token, effective_proxy.as_ref())
+                .await?;
+
+        let Some(arn) = profiles.first_arn().map(|s| s.to_string()) else {
+            // 无 Enterprise profile（如纯 BuilderID 账号）：保持占位符回退逻辑
+            return Ok(None);
+        };
+
+        // 写回真实 ARN 并持久化
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.credentials.profile_arn = Some(arn.clone());
+            }
+        }
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("profileArn 回填后持久化失败（不影响本次请求）: {}", e);
+        }
+        tracing::info!("凭据 #{} 已解析并回填真实 profileArn: {}", id, arn);
+
+        Ok(Some(arn))
+    }
+
+    /// 取得该凭据当前可用的 access token，必要时先刷新。
+    ///
+    /// 从 `get_usage_limits_for` 抽出，供所有「按 ID 发起单次上游调用」的入口共用。
+    async fn valid_token_for(&self, id: u64) -> anyhow::Result<String> {
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -1610,6 +1796,21 @@ impl MultiTokenManager {
                     .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
             }
         };
+
+        Ok(token)
+    }
+
+    /// 按凭据 ID 解析真实 profileArn（Admin / SSO 导入入口）。
+    ///
+    /// 与 [`Self::resolve_profile_arn_for`] 的区别只是自己负责取 token。
+    pub async fn resolve_profile_arn_for_id(&self, id: u64) -> anyhow::Result<Option<String>> {
+        let token = self.valid_token_for(id).await?;
+        self.resolve_profile_arn_for(id, &token).await
+    }
+
+    /// 获取指定凭据的使用额度（Admin API）
+    pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
+        let token = self.valid_token_for(id).await?;
 
         let credentials = {
             let entries = self.entries.lock();
@@ -2462,6 +2663,75 @@ mod tests {
             err
         );
         assert_eq!(manager.available_count(), 0);
+    }
+
+    // ============ profileArn 解析测试 ============
+
+    /// BuilderID 的「不支持此操作」是账号属性，必须识别为确定性否定 ——
+    /// 否则每个 BuilderID 凭据的每次请求都会白跑一次 ListAvailableProfiles。
+    #[test]
+    fn test_no_profile_concept_recognizes_builder_id_403() {
+        let body = r#"{"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"AWS Builder ID is not supported for this operation."}"#;
+        assert!(is_no_profile_concept_response(403, body));
+    }
+
+    /// 其余失败都必须保持可重试 —— 误判成「无 profile」会让 Enterprise 账号
+    /// 错用占位符 ARN，请求全数被拒。这是不采用「非 200 一律当空」粗口径的原因。
+    #[test]
+    fn test_no_profile_concept_rejects_retryable_failures() {
+        let builder_id_body = r#"{"message":"AWS Builder ID is not supported for this operation."}"#;
+
+        // 同样文案但非 403：不认
+        assert!(!is_no_profile_concept_response(500, builder_id_body));
+        assert!(!is_no_profile_concept_response(429, builder_id_body));
+
+        // 403 但是别的原因：不认（Enterprise 的 ARN 不对、token 失效等都是 403）
+        for body in [
+            r#"{"message":"Invalid token."}"#,
+            r#"{"message":"User is not authorized to make this call."}"#,
+            "",
+        ] {
+            assert!(
+                !is_no_profile_concept_response(403, body),
+                "不该把这个 403 当作确定性否定: {body}"
+            );
+        }
+
+        // 网络层失败（无响应体）：不认
+        assert!(!is_no_profile_concept_response(502, ""));
+    }
+
+    /// SSO 区域决定主端点：eu-* 走 eu-central-1，其余走 us-east-1，另一个作回退。
+    #[test]
+    fn test_rest_api_region_candidates() {
+        assert_eq!(
+            rest_api_region_candidates("eu-central-1"),
+            ["eu-central-1", "us-east-1"]
+        );
+        assert_eq!(
+            rest_api_region_candidates("eu-west-2"),
+            ["eu-central-1", "us-east-1"]
+        );
+        // 用户实测场景：IdC 门户在 ap-southeast-1，profile 实际在 us-east-1
+        assert_eq!(
+            rest_api_region_candidates("ap-southeast-1"),
+            ["us-east-1", "eu-central-1"]
+        );
+        assert_eq!(
+            rest_api_region_candidates("us-east-1"),
+            ["us-east-1", "eu-central-1"]
+        );
+    }
+
+    /// 占位符判别：只有 BuilderID 占位符算「还没解析过」，真实 ARN 与 Social ARN 都不算。
+    #[test]
+    fn test_is_placeholder_profile_arn() {
+        use crate::kiro::model::credentials::is_placeholder_profile_arn;
+        assert!(is_placeholder_profile_arn(BUILDER_ID_PROFILE_ARN));
+        assert!(!is_placeholder_profile_arn(SOCIAL_PROFILE_ARN));
+        assert!(!is_placeholder_profile_arn(
+            "arn:aws:codewhisperer:us-east-1:1234:profile/REAL"
+        ));
     }
 
     // ============ 用量接口 UA 与 profileArn 测试 ============
