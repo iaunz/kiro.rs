@@ -96,7 +96,7 @@ impl KiroEndpoint for IdeEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if let Some(ref arn) = ctx.credentials.profile_arn {
+        if let Some(arn) = ctx.credentials.streaming_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
@@ -106,7 +106,12 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
-        inject_profile_arn(body, &ctx.credentials.profile_arn)
+        // 上游已把流式端点的 profileArn 改为必填：完全不发会被拒
+        // `403 {"message":"User is not authorized to make this call."}`。
+        // 用 streaming_profile_arn() 而非裸 profile_arn —— 凭据没回填 ARN 时
+        // 它按登录方式补默认值（BuilderID 占位符 / Social 共享 ARN），
+        // 而裸字段在这种情况下是 None，等于什么都不发。
+        inject_profile_arn(body, &ctx.credentials.streaming_profile_arn())
     }
 }
 
@@ -125,8 +130,82 @@ fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> Strin
 
 #[cfg(test)]
 mod tests {
-    use super::inject_profile_arn;
+    use super::*;
+    use crate::kiro::model::credentials::{
+        BUILDER_ID_PROFILE_ARN, KiroCredentials, SOCIAL_PROFILE_ARN,
+    };
+    use crate::model::config::Config;
     use serde_json::Value;
+
+    fn body_profile_arn(credentials: &KiroCredentials) -> Option<String> {
+        let config = Config::default();
+        let ctx = RequestContext {
+            credentials,
+            token: "tok",
+            machine_id: "mid",
+            config: &config,
+        };
+        let out = IdeEndpoint::new().transform_api_body(r#"{"conversationState":{}}"#, &ctx);
+        let json: Value = serde_json::from_str(&out).unwrap();
+        json.get("profileArn")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    /// 回归：IdC 凭据没回填 profileArn 时，此前整个字段都不发，上游回
+    /// `403 {"message":"User is not authorized to make this call."}`。
+    /// 现在必须补上 BuilderID 占位符。
+    #[test]
+    fn test_api_body_fills_arn_for_idc_without_profile_arn() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            body_profile_arn(&credentials).as_deref(),
+            Some(BUILDER_ID_PROFILE_ARN)
+        );
+    }
+
+    /// Social 凭据缺 ARN 时补共享 Social ARN。
+    #[test]
+    fn test_api_body_fills_social_arn() {
+        let credentials = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            profile_arn: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            body_profile_arn(&credentials).as_deref(),
+            Some(SOCIAL_PROFILE_ARN)
+        );
+    }
+
+    /// 已有真实 ARN（Enterprise/IdC）时原样发送，不被占位符覆盖。
+    #[test]
+    fn test_api_body_keeps_resolved_arn() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:1234:profile/REAL".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            body_profile_arn(&credentials).as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:1234:profile/REAL")
+        );
+    }
+
+    /// API Key 凭据没有 profileArn 概念，仍然不发该字段。
+    #[test]
+    fn test_api_body_omits_arn_for_api_key() {
+        let credentials = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_test".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(body_profile_arn(&credentials), None);
+    }
 
     #[test]
     fn test_inject_profile_arn_with_some() {
