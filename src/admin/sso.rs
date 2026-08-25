@@ -482,6 +482,24 @@ async fn poll_and_import(ctx: PollContext) {
 
     match ctx.token_manager.add_credential(new_cred).await {
         Ok(credential_id) => {
+            // 解析真实 profileArn 并落盘（失败不影响导入）。
+            //
+            // AWS SSO OIDC 的 /token 不返回 profileArn（它没有 profile 概念），
+            // 所以导入出来的 IdC 凭据 profileArn 恒为 None。Enterprise / IdC 账号
+            // 不带真实 ARN 调流式端点会被拒 403，必须查 ListAvailableProfiles 补上。
+            // 这里提前解析一次，让凭据一导入就带上 ARN；漏掉也没关系 ——
+            // KiroProvider::ensure_profile_arn 会在首次请求前兜底。
+            match ctx.token_manager.resolve_profile_arn_for_id(credential_id).await {
+                Ok(Some(arn)) => {
+                    tracing::info!("SSO 导入后已解析 profileArn: 凭据 #{} → {}", credential_id, arn)
+                }
+                Ok(None) => tracing::info!(
+                    "凭据 #{} 无 Enterprise profile（BuilderID 等），将使用占位符 ARN",
+                    credential_id
+                ),
+                Err(e) => tracing::warn!("SSO 导入后解析 profileArn 失败（不影响导入）: {}", e),
+            }
+
             // 主动获取订阅等级（失败不影响导入）
             if let Err(e) = ctx.token_manager.get_usage_limits_for(credential_id).await {
                 tracing::warn!("SSO 导入后获取订阅等级失败（不影响导入）: {}", e);

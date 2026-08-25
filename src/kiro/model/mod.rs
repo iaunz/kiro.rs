@@ -7,7 +7,9 @@
 //! - `credentials`: OAuth 凭证
 //! - `token_refresh`: Token 刷新
 //! - `usage_limits`: 使用额度查询
+//! - `available_profiles`: 可用 profileArn 查询（Enterprise / IdC）
 
+pub mod available_profiles;
 pub mod common;
 pub mod credentials;
 pub mod events;
