@@ -14,7 +14,9 @@ use tokio::time::sleep;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
+use crate::kiro::model::available_models::UpstreamModel;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model_catalog::{ModelCatalogCache, fetch_available_models};
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
@@ -50,6 +52,7 @@ pub struct KiroProvider {
     /// （纯 BuilderID）靠这个集合避免每次请求都白跑一次往返。
     /// 网络抖动等不确定失败不写入，留待下次请求重试。
     profile_resolution_attempted: Mutex<HashSet<u64>>,
+    model_catalog: ModelCatalogCache,
 }
 
 impl KiroProvider {
@@ -86,6 +89,7 @@ impl KiroProvider {
             endpoints,
             default_endpoint,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
+            model_catalog: ModelCatalogCache::default(),
         }
     }
 
@@ -184,6 +188,31 @@ impl KiroProvider {
     /// 发送 MCP API 请求（WebSearch 等工具调用）
     pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         self.call_mcp_with_retry(request_body).await
+    }
+
+    /// 获取当前凭据可见的模型目录。成功缓存五分钟，失败保留旧值并退避三十秒。
+    ///
+    /// 该查询复用 Token、代理和 profile ARN 解析，不修改推理成功/失败计数。
+    /// 首次发现失败由调用者保留静态模型列表；后续失败返回上次成功的列表。
+    pub async fn available_models(&self) -> anyhow::Result<Vec<UpstreamModel>> {
+        self.model_catalog
+            .get_or_refresh(|| async {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    let mut ctx = self.token_manager.acquire_context(None).await?;
+                    self.ensure_profile_arn(&mut ctx).await;
+                    let client = self.client_for(&ctx.credentials)?;
+                    fetch_available_models(
+                        &client,
+                        &ctx.credentials,
+                        self.token_manager.config(),
+                        &ctx.token,
+                    )
+                    .await
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("自动获取 Kiro 模型超时"))?
+            })
+            .await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用

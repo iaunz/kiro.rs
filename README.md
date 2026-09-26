@@ -1,6 +1,6 @@
 # kiro-rs
 
-一个用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anthropic API 请求转换为 Kiro API 请求。
+一个用 Rust 编写的 Kiro API 代理，提供 Anthropic Messages 和 OpenAI Responses 兼容接口，支持 Claude 与 GPT-5.6 系列模型。
 
 ---
 
@@ -31,7 +31,7 @@
 
 ## 功能特性
 
-- **Anthropic API 兼容**: 完整支持 Anthropic Claude API 格式
+- **兼容接口**: 支持 Anthropic Messages 和 OpenAI Responses，便于接入 Claude Code、Codex 等客户端
 - **流式响应**: 支持 SSE (Server-Sent Events) 流式输出
 - **Token 自动刷新**: 自动管理和刷新 OAuth Token
 - **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
@@ -39,9 +39,10 @@
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
-- **工具调用**: 完整支持 function calling / tool use
+- **工具调用**: 支持 Anthropic tool use、Responses function/custom 工具，保留工具结果中的 Base64 图片
 - **WebSearch**: 内置 WebSearch 工具转换逻辑
-- **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
+- **多模型支持**: 支持 Sonnet、Opus、Haiku、Fable 与 GPT-5.6 Sol/Terra/Luna，以及 `sonnet`、`opus`、`haiku` 简写
+- **自动模型发现**: 从 Kiro 获取模型目录并缓存，查询失败时继续使用已有目录或静态列表
 - **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
 - **Credit 预警**: 后台定时汇总所有凭据的剩余额度，低于阈值时通过 Telegram / 邮件一次性告警
 - **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
@@ -66,9 +67,12 @@
 - [API 端点](#api-端点)
   - [标准端点 (/v1)](#标准端点-v1)
   - [Claude Code 兼容端点 (/cc/v1)](#claude-code-兼容端点-ccv1)
+  - [OpenAI Responses](#openai-responses)
   - [Thinking 模式](#thinking-模式)
   - [工具调用](#工具调用)
 - [模型映射](#模型映射)
+  - [自动获取 Kiro 模型](#自动获取-kiro-模型)
+  - [功能来源与范围](#功能来源与范围)
 - [Admin（可选）](#admin可选)
 - [注意事项](#注意事项)
 - [项目结构](#项目结构)
@@ -148,7 +152,7 @@ curl http://127.0.0.1:8990/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: sk-kiro-rs-qazWSXedcRFV123456" \
   -d '{
-    "model": "claude-sonnet-4-20250514",
+    "model": "sonnet",
     "max_tokens": 1024,
     "stream": true,
     "messages": [
@@ -317,7 +321,7 @@ docker-compose up
 
 ### 代理配置
 
-支持全局代理和凭据级代理，凭据级代理会覆盖该凭据产生的所有出站连接（API 请求、Token 刷新、额度查询）。
+支持全局代理和凭据级代理，凭据级代理用于该凭据的 API 请求、Token 刷新、额度查询和模型目录查询。
 
 **代理优先级**：`凭据.proxyUrl` > `config.proxyUrl` > 无代理
 
@@ -408,18 +412,22 @@ Credit 预警的 SMTP（邮件通知）连接参数也通过环境变量配置�
 
 ## API 端点
 
+以下端点均使用 `apiKey` 认证，支持 `x-api-key` 或 `Authorization: Bearer`。JSON 请求体上限为 **50 MiB（52,428,800 字节）**，包括 `/v1/responses`、`/v1/messages` 和 `/cc/v1/messages`；超过上限返回 HTTP 413。此限制包含 Base64 图片等整个请求体，与模型的 Token 上下文上限分别计算。
+
 ### 标准端点 (/v1)
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
-| `/v1/models` | GET | 获取可用模型列表 |
-| `/v1/messages` | POST | 创建消息（对话） |
+| `/v1/models` | GET | 返回动态模型目录与静态兼容模型列表 |
+| `/v1/messages` | POST | Anthropic Messages，支持流式及非流式输出 |
 | `/v1/messages/count_tokens` | POST | 估算 Token 数量 |
+| `/v1/responses` | POST | OpenAI Responses，支持流式及非流式输出 |
 
 ### Claude Code 兼容端点 (/cc/v1)
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
+| `/cc/v1/models` | GET | 与 `/v1/models` 共用模型目录和缓存 |
 | `/cc/v1/messages` | POST | 创建消息（缓冲模式，确保 `input_tokens` 准确） |
 | `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与 `/v1` 相同） |
 
@@ -428,29 +436,57 @@ Credit 预警的 SMTP（邮件通知）连接参数也通过环境变量配置�
 > - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
 > - 等待期间会每 25 秒发送 `ping` 事件保活
 
+### OpenAI Responses
+
+已有的 `/v1/responses` 兼容层接收字符串或消息数组形式的 `input`，支持 `instructions`、`max_output_tokens`、`stream` 和工具调用。客户端可将 API 地址设为 `http://127.0.0.1:8990/v1` 并选择 Responses 协议。本项目没有 `/v1/chat/completions` 端点。
+
+```bash
+curl http://127.0.0.1:8990/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-kiro-rs-qazWSXedcRFV123456" \
+  -d '{
+    "model": "gpt-5.6-sol",
+    "input": "用一句话介绍 Rust。",
+    "max_output_tokens": 1024,
+    "stream": true,
+    "store": false
+  }'
+```
+
+- `type: "function"` 工具使用 JSON 参数；`type: "custom"` 工具保留自由文本输入，回传 `custom_tool_call` 和对应输入增量事件，历史中的 `custom_tool_call_output` 可继续用于后续请求。
+- 支持展开 `namespace` 中的工具定义；自由文本工具的 `format` 会作为输入格式提示传给模型，不在本地执行语法校验。
+- Responses 按无状态方式工作，每次请求需携带必要的对话和工具历史。`previous_response_id`、`conversation`、`background: true` 和 `store: true` 会返回参数错误；`include` 提示可接收但不会生成额外的加密推理内容。
+- GPT-5.6 的推理由上游隐藏处理：`reasoning.effort` 不转换为 Claude thinking 标签，也不输出显式推理块。
+
 ### Thinking 模式
 
-支持 Claude 的 extended thinking 功能：
+Anthropic Messages 支持显式 `thinking.type: "enabled"` 或 `"adaptive"`。例如：
 
 ```json
 {
-  "model": "claude-sonnet-4-20250514",
+  "model": "claude-sonnet-4-5",
   "max_tokens": 16000,
   "thinking": {
     "type": "enabled",
     "budget_tokens": 10000
   },
-  "messages": [...]
+  "messages": [{"role": "user", "content": "解释这个问题的解法。"}]
 }
 ```
 
+模型名附加 `-thinking` 会覆写 thinking 配置：Opus 4.6、Opus 5、Sonnet 5、Fable 5.1 使用 `adaptive` 和 `high` effort，其余 Claude 模型使用 `enabled`，预算为 20,000 tokens。
+
+Sonnet 5、Opus 5（包括裸别名 `sonnet`、`opus`）默认拆分上游返回的 thinking 标签；无需为裸别名主动注入 thinking 参数。显式 `thinking.type: "disabled"` 可关闭默认拆分。非流式 Messages 的提取还受 `extractThinking` 配置控制。Fable 的 `-thinking` 版本使用 adaptive 模式。
+
+GPT-5.6 使用 hidden chain-of-thought：即使提供 `thinking` 或 `-thinking` 后缀，也不会注入 Claude thinking 标签或将响应拆分成 thinking 内容块。
+
 ### 工具调用
 
-完整支持 Anthropic 的 tool use 功能：
+Anthropic Messages 接收工具定义与 `tool_use` / `tool_result` 历史：
 
 ```json
 {
-  "model": "claude-sonnet-4-20250514",
+  "model": "sonnet",
   "max_tokens": 1024,
   "tools": [
     {
@@ -465,24 +501,51 @@ Credit 预警的 SMTP（邮件通知）连接参数也通过环境变量配置�
       }
     }
   ],
-  "messages": [...]
+  "messages": [{"role": "user", "content": "查询新加坡天气。"}]
 }
 ```
 
+`tool_result.content` 可同时包含 `text` 和 `image` 块。PNG、JPEG、GIF、WebP 的 Base64 图片会加入对应的 Kiro 用户消息，文本与工具执行状态继续保留；当前轮与历史轮的工具结果均适用。图片来源需使用 `source.type: "base64"`，不自动下载 URL 图片。
+
 ## 模型映射
 
-| Anthropic 模型 | Kiro 模型 |
-|----------------|-----------|
-| `*sonnet*` | `claude-sonnet-4.5` |
-| `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
-| `*opus*`（含 4.6/4-6） | `claude-opus-4.6` |
-| `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
-| `*opus*`（含 4.8/4-8） | `claude-opus-4.8` |
-| `*opus*`（含 5） | `claude-opus-5` |
-| `*haiku*` | `claude-haiku-4.5` |
-| `gpt-5.6-sol` | `gpt-5.6-sol` |
-| `gpt-5.6-terra` | `gpt-5.6-terra` |
-| `gpt-5.6-luna` | `gpt-5.6-luna` |
+Messages 与 Responses 共用模型映射。名称忽略大小写和两端空白；Claude 的显式版本可使用点号或连字符形式。
+
+| 客户端模型名 | Kiro 模型 ID | 静态上下文窗口 |
+|---|---|---|
+| `sonnet`、`claude-sonnet-5` | `claude-sonnet-5` | 1,000,000 |
+| `opus`、`claude-opus-5` | `claude-opus-5` | 1,000,000 |
+| `haiku`、`claude-haiku-4-5` | `claude-haiku-4.5` | 200,000 |
+| `claude-fable-5-1`、`claude-fable-5.1` | `claude-fable-5.1` | 1,000,000 |
+| `claude-sonnet-4-6` | `claude-sonnet-4.6` | 1,000,000 |
+| `claude-sonnet-4-5` | `claude-sonnet-4.5` | 200,000 |
+| `claude-opus-4-6` / `4-7` / `4-8` | 对应的 `claude-opus-4.6` / `4.7` / `4.8` | 1,000,000 |
+| `claude-opus-4-5` | `claude-opus-4.5` | 200,000 |
+| `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` | 同名模型 | 272,000 |
+
+GPT-5.6 也接受 `gpt-5-6-*` 和 `openai.gpt-5.6-*` 写法。Claude 历史模糊别名仍保留兼容逻辑：未指定可识别版本的 Sonnet、Opus 分别回退到 4.5、4.6；仅精确裸别名 `sonnet`、`opus` 指向 5。因此 `claude-opus-4-20250514` 不会因为日期包含 `5` 而映射到 Opus 5。
+
+表中的上下文窗口是本地兜底值；若动态目录提供有效的 `maxInputTokens`，优先使用上游值。`GET /v1/models` 的 `max_tokens` 是输出上限，与此表的上下文窗口不同；新模型未公布输出上限且没有静态兼容值时，省略该字段。
+
+### 自动获取 Kiro 模型
+
+服务启动后在后台获取 Kiro 的 `ListAvailableModels` 目录，无需新增配置。`GET /v1/models` 与 `GET /cc/v1/models` 按需刷新并共用缓存：成功结果缓存 5 分钟，同一时间的查询合并为一次刷新；刷新失败保留最后一次成功结果，30 秒后允许重试。首次查询失败或没有可用 provider 时，接口仍返回静态兼容列表。这里的 5 分钟是缓存有效期，不是后台定时轮询间隔。
+
+目录查询会合并上游分页，复用当前凭据的 Token、API Region、代理和 profile ARN 处理；HTTP 查询使用 `profileArn` 参数，推理请求保留本地 profile ARN 解析与注入规则。查询优先使用配置的 API Region，遇到 403 时尝试兼容区域回退。
+
+成功获取后，客户端可以使用目录公布的新模型 ID。查询忽略大小写，但发送上游时保留目录中的原始 ID；不把任意未知模型名称直接转发。未发现且不满足静态兼容映射的名称会被拒绝。静态 Claude 历史别名规则仍然生效。
+
+动态目录与静态兼容项合并展示，静态项不代表当前账户一定有权限。目录来自本次选中的凭据，并非所有凭据的权限并集，也不对多凭据建立按模型分配策略。缓存只保存在内存，重启后重新获取；刚启动时可先调用 `/v1/models`，待发现完成后再使用新模型 ID。
+
+### 功能来源与范围
+
+本次功能按当前项目的路由、协议转换和凭据逻辑整合，以上说明依据整合后的实现重新整理：
+
+- [d0zingcat / 761e01b](https://github.com/d0zingcat/kiro.rs/commit/761e01bcea53abdc6bd1d52b441327c3fb0b0233)：Responses 的 50 MiB 请求体限制；本项目保留现有路由并补充回归验证。
+- [d0zingcat / 6e5553f](https://github.com/d0zingcat/kiro.rs/commit/6e5553f4afab4010410bf4eccd997cfde5a297fe)：GPT-5.6 hidden CoT 与 Responses 自由文本工具兼容。
+- [d0zingcat / 4e7e5a8](https://github.com/d0zingcat/kiro.rs/commit/4e7e5a8394ff92634bb810bceed0efed326997b6)：Claude Code 家族别名及默认 thinking 行为。
+- [hank9999 / PR #199](https://github.com/hank9999/kiro.rs/pull/199)：工具结果图片提取及 Claude Fable 5.1 支持。
+- [liuran001 / 2c581f6](https://github.com/liuran001/kiro.rs-admin/commit/2c581f6f522a324656fdf20b0341f813650765da)：仅提取自动获取 Kiro 模型目录的能力，缓存与当前项目集成逻辑在本地实现。
 
 ## Admin（可选）
 
@@ -525,14 +588,17 @@ kiro-rs/
 │   │   ├── middleware.rs       # 认证中间件
 │   │   ├── types.rs            # 类型定义
 │   │   ├── converter.rs        # 协议转换器
+│   │   ├── responses.rs        # OpenAI Responses 兼容层
 │   │   ├── stream.rs           # 流式响应处理
 │   │   └── websearch.rs        # WebSearch 工具处理
 │   ├── kiro/                   # Kiro API 客户端
 │   │   ├── provider.rs         # API 提供者
+│   │   ├── model_catalog.rs    # 自动模型发现与缓存
 │   │   ├── token_manager.rs    # Token 管理
 │   │   ├── machine_id.rs       # 设备指纹生成
 │   │   ├── model/              # 数据模型
 │   │   │   ├── credentials.rs  # OAuth 凭证
+│   │   │   ├── available_models.rs # 上游模型目录与 Token 限额
 │   │   │   ├── events/         # 响应事件类型
 │   │   │   ├── requests/       # 请求类型
 │   │   │   ├── common/         # 共享类型
