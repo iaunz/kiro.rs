@@ -48,7 +48,8 @@ pub struct Model {
     pub display_name: String,
     #[serde(rename = "type")]
     pub model_type: String,
-    pub max_tokens: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i32>,
 }
 
 /// 模型列表响应

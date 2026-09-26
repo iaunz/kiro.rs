@@ -2,11 +2,11 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -21,10 +21,13 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{ConversionError, convert_request, map_model};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -70,10 +73,22 @@ fn map_provider_error(err: Error) -> Response {
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
+    let mut models = static_models();
+    if let Some(provider) = &state.kiro_provider {
+        if let Ok(discovered) = provider.available_models().await {
+            merge_discovered_models(&mut models, discovered);
+        }
+    }
+    Json(ModelsResponse {
+        object: "list".to_string(),
+        data: models,
+    })
+}
 
-    let models = vec![
+fn static_models() -> Vec<Model> {
+    let mut models = vec![
         Model {
             id: "gpt-5.6-sol".to_string(),
             object: "model".to_string(),
@@ -81,7 +96,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "openai".to_string(),
             display_name: "GPT-5.6 Sol".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 128_000,
+            max_tokens: Some(128_000),
         },
         Model {
             id: "gpt-5.6-terra".to_string(),
@@ -90,7 +105,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "openai".to_string(),
             display_name: "GPT-5.6 Terra".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 128_000,
+            max_tokens: Some(128_000),
         },
         Model {
             id: "gpt-5.6-luna".to_string(),
@@ -99,7 +114,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "openai".to_string(),
             display_name: "GPT-5.6 Luna".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 128_000,
+            max_tokens: Some(128_000),
         },
         Model {
             id: "claude-opus-5".to_string(),
@@ -108,7 +123,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 5".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 128_000,
+            max_tokens: Some(128_000),
         },
         Model {
             id: "claude-opus-5-thinking".to_string(),
@@ -117,7 +132,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 128_000,
+            max_tokens: Some(128_000),
         },
         Model {
             id: "claude-opus-4-8".to_string(),
@@ -126,7 +141,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.8".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 128_000,
+            max_tokens: Some(128_000),
         },
         Model {
             id: "claude-opus-4-8-thinking".to_string(),
@@ -135,7 +150,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.8 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 128_000,
+            max_tokens: Some(128_000),
         },
         Model {
             id: "claude-opus-4-7".to_string(),
@@ -144,7 +159,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.7".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: Some(64000),
         },
         Model {
             id: "claude-opus-4-7-thinking".to_string(),
@@ -153,7 +168,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.7 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: Some(64000),
         },
         Model {
             id: "claude-opus-4-6".to_string(),
@@ -162,7 +177,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.6".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: Some(64000),
         },
         Model {
             id: "claude-opus-4-6-thinking".to_string(),
@@ -171,7 +186,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.6 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: Some(64000),
         },
         Model {
             id: "claude-sonnet-4-6".to_string(),
@@ -180,7 +195,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.6".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: Some(64000),
         },
         Model {
             id: "claude-sonnet-4-6-thinking".to_string(),
@@ -189,7 +204,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: Some(64000),
         },
         Model {
             id: "claude-opus-4-5-20251101".to_string(),
@@ -198,7 +213,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.5".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: Some(64000),
         },
         Model {
             id: "claude-opus-4-5-20251101-thinking".to_string(),
@@ -207,7 +222,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: Some(64000),
         },
         Model {
             id: "claude-sonnet-4-5-20250929".to_string(),
@@ -216,7 +231,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.5".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: Some(64000),
         },
         Model {
             id: "claude-sonnet-4-5-20250929-thinking".to_string(),
@@ -225,7 +240,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: Some(64000),
         },
         Model {
             id: "claude-haiku-4-5-20251001".to_string(),
@@ -234,7 +249,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Haiku 4.5".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: Some(64000),
         },
         Model {
             id: "claude-haiku-4-5-20251001-thinking".to_string(),
@@ -243,14 +258,86 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: Some(64000),
         },
     ];
 
-    Json(ModelsResponse {
-        object: "list".to_string(),
-        data: models,
-    })
+    for (id, name) in [
+        ("claude-sonnet-5", "Claude Sonnet 5"),
+        ("claude-fable-5-1", "Claude Fable 5.1"),
+    ] {
+        for thinking in [false, true] {
+            models.push(Model {
+                id: if thinking {
+                    format!("{id}-thinking")
+                } else {
+                    id.into()
+                },
+                object: "model".into(),
+                created: 0,
+                owned_by: "anthropic".into(),
+                display_name: if thinking {
+                    format!("{name} (Thinking)")
+                } else {
+                    name.into()
+                },
+                model_type: "chat".into(),
+                max_tokens: Some(128_000),
+            });
+        }
+    }
+    models
+}
+
+fn merge_discovered_models(
+    models: &mut Vec<Model>,
+    discovered: Vec<crate::kiro::model::available_models::UpstreamModel>,
+) {
+    for model in discovered {
+        let output_limit = model
+            .token_limits
+            .as_ref()
+            .and_then(|limits| limits.max_output_tokens)
+            .and_then(|limit| i32::try_from(limit).ok())
+            .filter(|limit| *limit > 0)
+            .or_else(|| {
+                models.iter().find_map(|existing| {
+                    (map_model(&existing.id).as_deref() == Some(model.model_id.as_str()))
+                        .then_some(existing.max_tokens)
+                        .flatten()
+                })
+            });
+        // Update the limits of existing compatibility aliases as well as the exact ID.
+        for existing in models.iter_mut() {
+            if map_model(&existing.id).as_deref() == Some(model.model_id.as_str()) {
+                if let Some(limit) = output_limit {
+                    existing.max_tokens = Some(limit);
+                }
+            }
+        }
+        if models.iter().any(|existing| existing.id == model.model_id) {
+            continue;
+        }
+        let owner = if model.model_id.starts_with("claude-") {
+            "anthropic"
+        } else if model.model_id.starts_with("gpt-") {
+            "openai"
+        } else {
+            "kiro"
+        };
+        models.push(Model {
+            display_name: model
+                .model_name
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| model.model_id.clone()),
+            id: model.model_id,
+            object: "model".into(),
+            created: 0,
+            owned_by: owner.into(),
+            model_type: "chat".into(),
+            max_tokens: output_limit,
+        });
+    }
 }
 
 /// POST /v1/messages
@@ -354,11 +441,7 @@ pub async fn post_messages(
     ) as i32;
 
     // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
+    let thinking_enabled = should_extract_thinking(&payload.model, &payload.thinking);
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -376,7 +459,15 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+        )
+        .await
     }
 }
 
@@ -396,7 +487,8 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx =
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -586,14 +678,14 @@ async fn handle_non_stream_request(
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
-                                            );
-                                            serde_json::json!({})
-                                        })
+                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                            e,
+                                            tool_use.tool_use_id
+                                        );
+                                        serde_json::json!({})
+                                    })
                                 };
 
                                 let original_name = tool_name_map
@@ -612,10 +704,9 @@ async fn handle_non_stream_request(
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
+                            let actual_input_tokens =
+                                (context_usage.context_usage_percentage * (window_size as f64)
+                                    / 100.0) as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
@@ -701,9 +792,31 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
+/// Sonnet 5 / Opus 5（含裸别名）默认拆分上游的 thinking 标签，除非显式禁用。
+/// GPT-5.6 使用隐藏推理，其他模型仅在客户端显式开启时拆分。
+pub(crate) fn should_extract_thinking(model: &str, thinking: &Option<Thinking>) -> bool {
+    let model_lower = model.to_lowercase();
+    if model_lower.contains("gpt-5.6") || model_lower.contains("gpt-5-6") {
+        return false;
+    }
+
+    if matches!(
+        map_model(model).as_deref(),
+        Some("claude-sonnet-5") | Some("claude-opus-5")
+    ) {
+        thinking
+            .as_ref()
+            .map(|t| t.thinking_type != "disabled")
+            .unwrap_or(true)
+    } else {
+        thinking.as_ref().map(Thinking::is_enabled).unwrap_or(false)
+    }
+}
+
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
+/// - Opus 4.6 / Opus 5 / Sonnet 5 / Fable 5.1：覆写为 adaptive 类型
+/// - GPT-5.6：保留隐藏推理，不注入 Claude thinking 配置
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
@@ -712,10 +825,19 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    if model_lower.contains("gpt-5.6") || model_lower.contains("gpt-5-6") {
+        return;
+    }
 
-    let thinking_type = if is_opus_4_6 {
+    let is_adaptive_thinking = matches!(
+        map_model(&payload.model).as_deref(),
+        Some("claude-opus-4.6")
+            | Some("claude-opus-5")
+            | Some("claude-sonnet-5")
+            | Some("claude-fable-5.1")
+    );
+
+    let thinking_type = if is_adaptive_thinking {
         "adaptive"
     } else {
         "enabled"
@@ -731,11 +853,194 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
-    if is_opus_4_6 {
+
+    if is_adaptive_thinking {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovered_models_keep_aliases_and_inherit_known_output_limits() {
+        let mut models = static_models();
+        let discovered = serde_json::from_value(json!([
+            {"modelId":"claude-opus-4.8", "modelName":"Claude Opus 4.8", "tokenLimits":{"maxInputTokens":1000000}},
+            {"modelId":"new-upstream-model", "modelName":"New model", "tokenLimits":{"maxInputTokens":250000}},
+            {"modelId":"new-upstream-model"}
+        ])).unwrap();
+        merge_discovered_models(&mut models, discovered);
+        assert!(models.iter().any(|m| m.id == "claude-opus-4-8-thinking"));
+        assert_eq!(
+            models
+                .iter()
+                .find(|m| m.id == "claude-opus-4.8")
+                .unwrap()
+                .max_tokens,
+            Some(128_000)
+        );
+        assert_eq!(
+            models
+                .iter()
+                .filter(|m| m.id == "new-upstream-model")
+                .count(),
+            1
+        );
+        let new_model = models
+            .iter()
+            .find(|m| m.id == "new-upstream-model")
+            .unwrap();
+        assert_eq!(new_model.display_name, "New model");
+        assert!(
+            serde_json::to_value(new_model)
+                .unwrap()
+                .get("max_tokens")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn discovered_output_limits_update_existing_static_ids_and_aliases() {
+        let mut models = static_models();
+        let discovered = serde_json::from_value(json!([
+            {"modelId":"claude-sonnet-5", "tokenLimits":{"maxOutputTokens":96000}},
+            {"modelId":"claude-opus-4.8", "tokenLimits":{"maxOutputTokens":32000}}
+        ]))
+        .unwrap();
+        merge_discovered_models(&mut models, discovered);
+        for id in ["claude-sonnet-5", "claude-sonnet-5-thinking"] {
+            assert_eq!(
+                models.iter().find(|m| m.id == id).unwrap().max_tokens,
+                Some(96_000)
+            );
+        }
+        for id in [
+            "claude-opus-4.8",
+            "claude-opus-4-8",
+            "claude-opus-4-8-thinking",
+        ] {
+            assert_eq!(
+                models.iter().find(|m| m.id == id).unwrap().max_tokens,
+                Some(32_000)
+            );
+        }
+        assert_eq!(
+            models.iter().filter(|m| m.id == "claude-sonnet-5").count(),
+            1
+        );
+    }
+
+    fn request(model: &str) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": model,
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn adaptive_families_extract_thinking_by_default_and_honor_disabled() {
+        for model in [
+            "sonnet",
+            " OPUS ",
+            "SONNET",
+            "claude-sonnet-5",
+            "claude-opus-5-thinking",
+        ] {
+            assert!(should_extract_thinking(model, &None), "{model}");
+            assert!(
+                !should_extract_thinking(
+                    model,
+                    &Some(Thinking {
+                        thinking_type: "disabled".to_string(),
+                        budget_tokens: 0,
+                    })
+                ),
+                "{model}"
+            );
+
+            // 裸别名的默认响应拆分不应向请求注入 thinking 控制参数。
+            if !model.contains("thinking") {
+                let mut payload = request(model);
+                override_thinking_from_model_name(&mut payload);
+                assert!(payload.thinking.is_none());
+                assert!(payload.output_config.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn gpt_hidden_cot_ignores_thinking_suffix_and_explicit_configuration() {
+        for model in [
+            "gpt-5.6-sol-thinking",
+            "openai.gpt-5-6-terra-thinking",
+            "GPT-5.6-LUNA",
+        ] {
+            let mut payload = request(model);
+            override_thinking_from_model_name(&mut payload);
+            assert!(payload.thinking.is_none());
+            assert!(payload.output_config.is_none());
+
+            for thinking_type in ["enabled", "adaptive"] {
+                payload.thinking = Some(Thinking {
+                    thinking_type: thinking_type.to_string(),
+                    budget_tokens: 1234,
+                });
+                override_thinking_from_model_name(&mut payload);
+                assert!(
+                    !should_extract_thinking(model, &payload.thinking),
+                    "{model}"
+                );
+                assert_eq!(payload.thinking.as_ref().unwrap().budget_tokens, 1234);
+            }
+        }
+    }
+
+    #[test]
+    fn thinking_suffix_selects_supported_claude_mode() {
+        for (model, expected_type) in [
+            ("claude-opus-4-6-thinking", "adaptive"),
+            ("claude-opus-5-thinking", "adaptive"),
+            ("claude-sonnet-5-thinking", "adaptive"),
+            ("claude-fable-5-1-thinking", "adaptive"),
+            ("claude-fable-5.1-thinking", "adaptive"),
+            ("claude-sonnet-4-5-thinking", "enabled"),
+            ("claude-haiku-4-5-thinking", "enabled"),
+        ] {
+            let mut payload = request(model);
+            override_thinking_from_model_name(&mut payload);
+            let thinking = payload.thinking.as_ref().unwrap();
+            assert_eq!(thinking.thinking_type, expected_type, "{model}");
+            assert_eq!(thinking.budget_tokens, 20000);
+            assert_eq!(
+                payload.output_config.as_ref().map(|o| o.effort.as_str()),
+                if expected_type == "adaptive" {
+                    Some("high")
+                } else {
+                    None
+                }
+            );
+            assert!(should_extract_thinking(model, &payload.thinking));
+        }
+    }
+
+    #[test]
+    fn other_claude_models_require_explicit_thinking() {
+        for model in ["haiku", "claude-sonnet-4-6", "claude-fable-5-1"] {
+            assert!(!should_extract_thinking(model, &None));
+            assert!(should_extract_thinking(
+                model,
+                &Some(Thinking {
+                    thinking_type: "enabled".to_string(),
+                    budget_tokens: 20000,
+                })
+            ));
+        }
     }
 }
 
@@ -867,11 +1172,7 @@ pub async fn post_messages_cc(
     ) as i32;
 
     // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
+    let thinking_enabled = should_extract_thinking(&payload.model, &payload.thinking);
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -889,7 +1190,15 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+        )
+        .await
     }
 }
 
@@ -912,7 +1221,12 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+    );
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

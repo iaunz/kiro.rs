@@ -32,7 +32,8 @@ use crate::{
 };
 
 use super::{
-    converter::{ConversionError, convert_request, get_context_window_size},
+    converter::{ConversionError, convert_request, get_context_window_size, map_model},
+    handlers::should_extract_thinking,
     middleware::AppState,
     stream::extract_thinking_from_complete_text,
     types::{Message, MessagesRequest, OutputConfig, SystemMessage, Thinking, Tool},
@@ -79,6 +80,7 @@ struct ResponseTool {
     name: Option<String>,
     description: Option<String>,
     parameters: Option<Value>,
+    format: Option<Value>,
     /// Inner function tools for `type: "namespace"` grouping tools.
     #[serde(default)]
     tools: Vec<ResponseTool>,
@@ -162,7 +164,7 @@ pub async fn post_response(
         Ok(JsonExtractor(payload)) => payload,
         Err(error) => {
             return error_response(
-                StatusCode::BAD_REQUEST,
+                error.status(),
                 RequestError::new(format!("Invalid JSON request: {error}"), "body"),
             );
         }
@@ -244,6 +246,7 @@ pub async fn post_response(
             mapped.thinking_enabled,
             conversion.tool_name_map,
             available_tool_names,
+            mapped.custom_tool_names,
             prep_ms,
         )
         .await
@@ -258,6 +261,7 @@ pub async fn post_response(
             mapped.thinking_enabled,
             conversion.tool_name_map,
             available_tool_names,
+            mapped.custom_tool_names,
         )
         .await
     }
@@ -268,6 +272,7 @@ struct MappedRequest {
     messages: MessagesRequest,
     max_output_tokens: i32,
     thinking_enabled: bool,
+    custom_tool_names: HashSet<String>,
 }
 
 fn map_request(request: ResponsesRequest) -> Result<MappedRequest, RequestError> {
@@ -294,7 +299,7 @@ fn map_request(request: ResponsesRequest) -> Result<MappedRequest, RequestError>
     normalize_messages(&mut messages)?;
     let mut all_tools = request.tools;
     all_tools.append(&mut extra_tools);
-    let tools = map_tools(all_tools)?;
+    let (tools, custom_tool_names) = map_tools(all_tools)?;
     let tool_choice = map_tool_choice(request.tool_choice, &tools)?;
     let tools_enabled = !tools.is_empty()
         && tool_choice
@@ -307,8 +312,14 @@ fn map_request(request: ResponsesRequest) -> Result<MappedRequest, RequestError>
             text: TOOL_TURN_COMPLETION_POLICY.to_string(),
         });
     }
+    let explicitly_disabled =
+        request.reasoning.as_ref().and_then(|r| r.effort.as_deref()) == Some("none");
     let (thinking, output_config) = map_reasoning(&request.model, request.reasoning)?;
-    let thinking_enabled = thinking.as_ref().is_some_and(Thinking::is_enabled);
+    let thinking_enabled = if explicitly_disabled && thinking.is_none() {
+        false
+    } else {
+        should_extract_thinking(&request.model, &thinking)
+    };
 
     Ok(MappedRequest {
         messages: MessagesRequest {
@@ -325,6 +336,7 @@ fn map_request(request: ResponsesRequest) -> Result<MappedRequest, RequestError>
         },
         max_output_tokens,
         thinking_enabled,
+        custom_tool_names,
     })
 }
 
@@ -413,6 +425,30 @@ fn map_input_item(
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("message");
+    if item_type == "additional_tools"
+        || (item_type != "message"
+            && object.get("role").and_then(Value::as_str) == Some("developer")
+            && object.contains_key("tools"))
+    {
+        let definitions = object
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                RequestError::new(
+                    "additional tools must be an array",
+                    format!("input[{index}].tools"),
+                )
+            })?;
+        for (tool_index, definition) in definitions.iter().enumerate() {
+            extra_tools.push(serde_json::from_value(definition.clone()).map_err(|error| {
+                RequestError::new(
+                    format!("Invalid tool definition: {error}"),
+                    format!("input[{index}].tools[{tool_index}]"),
+                )
+            })?);
+        }
+        return Ok(());
+    }
     match item_type {
         "message" => {
             let role = required_string(object, "role", index)?;
@@ -430,20 +466,6 @@ fn map_input_item(
         "function_call" | "custom_tool_call" => map_function_call(object, index, messages),
         "function_call_output" | "custom_tool_call_output" => {
             map_function_output(object, index, messages)
-        }
-        // `additional_tools` is a developer-role item that carries tool
-        // definitions inside the input stream (Codex places tools here instead
-        // of the top-level `tools` field in some turns). Collect them so they
-        // are exposed to the backend alongside any top-level tools.
-        "additional_tools" => {
-            if let Some(tools) = object.get("tools").and_then(Value::as_array) {
-                for tool in tools {
-                    if let Ok(tool) = serde_json::from_value::<ResponseTool>(tool.clone()) {
-                        extra_tools.push(tool);
-                    }
-                }
-            }
-            Ok(())
         }
         // Other replayed item types (reasoning, web_search_call, image
         // generation, tool_search, etc.) have no Anthropic equivalent here.
@@ -648,28 +670,32 @@ fn map_function_call(
 ) -> Result<(), RequestError> {
     let call_id = required_string(object, "call_id", index)?;
     let name = required_string(object, "name", index)?;
-    // `function_call` uses `arguments` (a JSON string); `custom_tool_call`
-    // (freeform tools) uses `input` (a raw string that may not be JSON).
-    let (field, raw) = match object.get("arguments").and_then(Value::as_str) {
-        Some(arguments) => ("arguments", arguments),
-        None => ("input", required_string(object, "input", index)?),
-    };
-    // Freeform tool input can be arbitrary text; fall back to a wrapper object
-    // when it is not valid JSON so the backend always receives an object.
-    let input = match serde_json::from_str::<Value>(raw) {
-        Ok(value) if value.is_object() => value,
-        _ if field == "input" => json!({ "input": raw }),
-        Ok(_) => {
-            return Err(RequestError::new(
-                "function_call arguments must encode a JSON object",
-                format!("input[{index}].arguments"),
-            ));
-        }
-        Err(error) => {
-            return Err(RequestError::new(
-                format!("function_call arguments must be valid JSON: {error}"),
-                format!("input[{index}].arguments"),
-            ));
+    // Custom input is opaque text even when it happens to contain valid JSON.
+    let is_custom = object.get("type").and_then(Value::as_str) == Some("custom_tool_call");
+    let input = if is_custom {
+        let raw = object.get("input").and_then(Value::as_str).ok_or_else(|| {
+            RequestError::new(
+                "custom tool input must be a string",
+                format!("input[{index}].input"),
+            )
+        })?;
+        json!({"input": raw})
+    } else {
+        let raw = required_string(object, "arguments", index)?;
+        match serde_json::from_str::<Value>(raw) {
+            Ok(value) if value.is_object() => value,
+            Ok(_) => {
+                return Err(RequestError::new(
+                    "function_call arguments must encode a JSON object",
+                    format!("input[{index}].arguments"),
+                ));
+            }
+            Err(error) => {
+                return Err(RequestError::new(
+                    format!("function_call arguments must be valid JSON: {error}"),
+                    format!("input[{index}].arguments"),
+                ));
+            }
         }
     };
     messages.push(Message {
@@ -734,32 +760,68 @@ fn normalize_messages(messages: &mut [Message]) -> Result<(), RequestError> {
     Ok(())
 }
 
-fn map_tools(tools: Vec<ResponseTool>) -> Result<Vec<Tool>, RequestError> {
+fn map_tools(tools: Vec<ResponseTool>) -> Result<(Vec<Tool>, HashSet<String>), RequestError> {
     let mut mapped = Vec::new();
+    let mut custom_names = HashSet::new();
+    let mut seen = HashSet::new();
     for (index, tool) in tools.into_iter().enumerate() {
-        match tool.tool_type.as_str() {
-            "function" => mapped.push(map_function_tool(tool, format!("tools[{index}]"))?),
-            // `namespace` is a grouping container: its `tools` array holds
-            // ordinary function tools with globally unique leaf names. Flatten
-            // them into standalone functions so the backend sees every callable.
-            "namespace" => {
-                for (inner_index, inner) in tool.tools.into_iter().enumerate() {
-                    if inner.tool_type != "function" {
-                        continue;
-                    }
-                    mapped.push(map_function_tool(
-                        inner,
-                        format!("tools[{index}].tools[{inner_index}]"),
-                    )?);
-                }
-            }
-            // Other built-in tool types (e.g. `web_search`) have no function
-            // schema and are not backed by this service. Skip them rather than
-            // rejecting the whole request so the turn can still proceed.
-            _ => continue,
-        }
+        flatten_tool(
+            tool,
+            format!("tools[{index}]"),
+            &mut mapped,
+            &mut custom_names,
+            &mut seen,
+        )?;
     }
-    Ok(mapped)
+    Ok((mapped, custom_names))
+}
+
+fn flatten_tool(
+    mut tool: ResponseTool,
+    param: String,
+    mapped: &mut Vec<Tool>,
+    custom_names: &mut HashSet<String>,
+    seen: &mut HashSet<String>,
+) -> Result<(), RequestError> {
+    if tool.tool_type == "namespace" {
+        for (index, inner) in tool.tools.into_iter().enumerate() {
+            flatten_tool(
+                inner,
+                format!("{param}.tools[{index}]"),
+                mapped,
+                custom_names,
+                seen,
+            )?;
+        }
+        return Ok(());
+    }
+    let is_custom = tool.tool_type == "custom";
+    if !is_custom && tool.tool_type != "function" {
+        return Ok(());
+    }
+    if is_custom {
+        let mut description = tool.description.unwrap_or_default();
+        description.push_str("\nThis is a freeform tool. Put the raw tool input in the input string field without additional JSON wrapping.");
+        if let Some(format) = tool.format {
+            description.push_str(&format!("\nRequired input format: {format}"));
+        }
+        tool.description = Some(description);
+        tool.parameters = Some(json!({
+            "type": "object",
+            "properties": {"input": {"type": "string", "description": "Raw freeform tool input"}},
+            "required": ["input"]
+        }));
+        tool.format = None;
+    }
+    let tool = map_function_tool(tool, param)?;
+    // Top-level definitions take precedence over repeated history definitions.
+    if seen.insert(tool.name.clone()) {
+        if is_custom {
+            custom_names.insert(tool.name.clone());
+        }
+        mapped.push(tool);
+    }
+    Ok(())
 }
 
 fn map_function_tool(tool: ResponseTool, param: String) -> Result<Tool, RequestError> {
@@ -792,7 +854,12 @@ fn map_tool_choice(choice: Option<Value>, tools: &[Tool]) -> Result<Option<Value
         Value::String(value) if value == "auto" => Ok(Some(json!({"type": "auto"}))),
         Value::String(value) if value == "none" => Ok(Some(json!({"type": "none"}))),
         Value::String(value) if value == "required" => Ok(Some(json!({"type": "any"}))),
-        Value::Object(object) if object.get("type").and_then(Value::as_str) == Some("function") => {
+        Value::Object(object)
+            if matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("function" | "custom")
+            ) =>
+        {
             let name = object
                 .get("name")
                 .and_then(Value::as_str)
@@ -817,6 +884,13 @@ fn map_reasoning(
     reasoning: Option<ReasoningConfig>,
 ) -> Result<(Option<Thinking>, Option<OutputConfig>), RequestError> {
     let model_lower = model.to_lowercase();
+    if model_lower.contains("gpt-5.6") || model_lower.contains("gpt-5-6") {
+        return Ok((None, None));
+    }
+    let default_adaptive = matches!(
+        map_model(model).as_deref(),
+        Some("claude-sonnet-5" | "claude-opus-5" | "claude-fable-5.1")
+    );
     let suffix_enabled = model_lower.contains("thinking");
     let effort = reasoning.and_then(|reasoning| reasoning.effort);
     if let Some(value) = effort.as_deref() {
@@ -834,7 +908,8 @@ fn map_reasoning(
         return Ok((None, None));
     }
 
-    let adaptive = !suffix_enabled
+    let adaptive = default_adaptive
+        || !suffix_enabled
         || (model_lower.contains("opus")
             && (model_lower.contains("4-6") || model_lower.contains("4.6")));
     let thinking = Thinking {
@@ -857,6 +932,7 @@ struct CollectedResponse {
     max_output_tokens: i32,
     incomplete_reason: Option<String>,
     created_at: i64,
+    custom_tool_names: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -877,6 +953,7 @@ async fn handle_non_stream(
     thinking_enabled: bool,
     tool_name_map: HashMap<String, String>,
     available_tool_names: HashSet<String>,
+    custom_tool_names: HashSet<String>,
 ) -> Response {
     let response = match provider.call_api(&request_body).await {
         Ok(response) => response,
@@ -891,7 +968,7 @@ async fn handle_non_stream(
             );
         }
     };
-    let collected = match collect_response(
+    let mut collected = match collect_response(
         &bytes,
         &model,
         estimated_input_tokens,
@@ -903,6 +980,7 @@ async fn handle_non_stream(
         Ok(collected) => collected,
         Err(error) => return api_error(StatusCode::BAD_GATEWAY, error),
     };
+    collected.custom_tool_names = custom_tool_names;
     let body = build_response_body(&response_id, &model, &collected);
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -1021,6 +1099,7 @@ fn collect_response(
         max_output_tokens,
         incomplete_reason,
         created_at: chrono::Utc::now().timestamp(),
+        custom_tool_names: HashSet::new(),
     })
 }
 
@@ -1051,17 +1130,47 @@ fn build_response_body(response_id: &str, model: &str, collected: &CollectedResp
         }));
     }
     for call in &collected.calls {
-        output.push(json!({
-            "id": call.item_id,
-            "type": "function_call",
-            "status": "completed",
-            "call_id": call.call_id,
-            "name": call.name,
-            "arguments": call.arguments
-        }));
+        output.push(call_item(
+            call,
+            collected.custom_tool_names.contains(&call.name),
+            "completed",
+        ));
     }
 
     response_snapshot(response_id, model, collected, output, None)
+}
+
+fn custom_tool_input(arguments: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(arguments) {
+        if let Some(input) = value.as_str() {
+            return input.to_string();
+        }
+        for key in ["input", "code", "source", "script", "content"] {
+            if let Some(input) = value.get(key).and_then(Value::as_str) {
+                return input.to_string();
+            }
+        }
+    }
+    arguments.to_string()
+}
+
+fn call_item(call: &CollectedCall, is_custom: bool, status: &str) -> Value {
+    let mut item = json!({
+        "id": call.item_id,
+        "type": if is_custom { "custom_tool_call" } else { "function_call" },
+        "status": status,
+        "call_id": call.call_id,
+        "name": call.name
+    });
+    let value = if status == "in_progress" {
+        String::new()
+    } else if is_custom {
+        custom_tool_input(&call.arguments)
+    } else {
+        call.arguments.clone()
+    };
+    item[if is_custom { "input" } else { "arguments" }] = json!(value);
+    item
 }
 
 fn response_snapshot(
@@ -1201,6 +1310,7 @@ struct ResponseStreamContext {
     thinking_enabled: bool,
     tool_name_map: HashMap<String, String>,
     available_tool_names: HashSet<String>,
+    custom_tool_names: HashSet<String>,
     text: String,
     calls: Vec<CollectedCall>,
     call_buffers: HashMap<String, (String, String)>,
@@ -1234,6 +1344,7 @@ impl ResponseStreamContext {
             thinking_enabled,
             tool_name_map,
             available_tool_names,
+            custom_tool_names: HashSet::new(),
             text: String::new(),
             calls: Vec::new(),
             call_buffers: HashMap::new(),
@@ -1411,6 +1522,7 @@ impl ResponseStreamContext {
             max_output_tokens: self.max_output_tokens,
             incomplete_reason: self.incomplete_reason.clone(),
             created_at: self.created_at,
+            custom_tool_names: self.custom_tool_names.clone(),
         }
     }
 
@@ -1582,47 +1694,39 @@ impl ResponseStreamContext {
     }
 
     fn call_events(&mut self, call: &CollectedCall, output_index: i64) -> Vec<Bytes> {
-        let base_item = json!({
-            "id": call.item_id,
-            "type": "function_call",
-            "status": "in_progress",
-            "call_id": call.call_id,
-            "name": call.name,
-            "arguments": ""
-        });
+        let is_custom = self.custom_tool_names.contains(&call.name);
+        let base_item = call_item(call, is_custom, "in_progress");
+        let input = if is_custom {
+            custom_tool_input(&call.arguments)
+        } else {
+            call.arguments.clone()
+        };
+        let event_prefix = if is_custom {
+            "response.custom_tool_call_input"
+        } else {
+            "response.function_call_arguments"
+        };
+        let mut done = json!({"item_id": call.item_id, "output_index": output_index});
+        done[if is_custom { "input" } else { "arguments" }] = json!(input);
         vec![
             self.event(
                 "response.output_item.added",
                 json!({"output_index": output_index, "item": base_item}),
             ),
             self.event(
-                "response.function_call_arguments.delta",
+                &format!("{event_prefix}.delta"),
                 json!({
                     "item_id": call.item_id,
                     "output_index": output_index,
-                    "delta": call.arguments
+                    "delta": input
                 }),
             ),
-            self.event(
-                "response.function_call_arguments.done",
-                json!({
-                    "item_id": call.item_id,
-                    "output_index": output_index,
-                    "arguments": call.arguments
-                }),
-            ),
+            self.event(&format!("{event_prefix}.done"), done),
             self.event(
                 "response.output_item.done",
                 json!({
                     "output_index": output_index,
-                    "item": {
-                        "id": call.item_id,
-                        "type": "function_call",
-                        "status": "completed",
-                        "call_id": call.call_id,
-                        "name": call.name,
-                        "arguments": call.arguments
-                    }
+                    "item": call_item(call, is_custom, "completed")
                 }),
             ),
         ]
@@ -1666,6 +1770,7 @@ async fn handle_stream(
     thinking_enabled: bool,
     tool_name_map: HashMap<String, String>,
     available_tool_names: HashSet<String>,
+    custom_tool_names: HashSet<String>,
     prep_ms: u128,
 ) -> Response {
     // 诊断：单独计量 call_api_stream（网络 + 重试退避 + 可能的 token 刷新）的耗时，
@@ -1716,6 +1821,7 @@ async fn handle_stream(
         available_tool_names,
         input_tokens,
     );
+    ctx.custom_tool_names = custom_tool_names;
     let initial = ctx.initial_events();
     let stream = build_stream(upstream, ctx, initial);
 
@@ -1974,9 +2080,8 @@ mod tests {
             .iter()
             .map(|t| t.name.clone())
             .collect();
-        // `custom` (freeform) has no function schema and is skipped; the
-        // function and flattened namespace tool are exposed.
-        assert_eq!(names, vec!["wait", "spawn_agent"]);
+        assert_eq!(names, vec!["exec", "wait", "spawn_agent"]);
+        assert!(mapped.custom_tool_names.contains("exec"));
     }
 
     #[test]
@@ -2065,6 +2170,165 @@ mod tests {
         assert_eq!(mapped.messages.thinking.unwrap().thinking_type, "enabled");
     }
 
+    #[test]
+    fn gpt_reasoning_never_injects_claude_thinking() {
+        for model in [
+            "gpt-5.6-sol",
+            "openai.gpt-5.6-terra-thinking",
+            "gpt-5-6-luna",
+        ] {
+            let mut req = request_with_model(model);
+            req.reasoning = Some(ReasoningConfig {
+                effort: Some("high".into()),
+            });
+            let mapped = map_request(req).unwrap();
+            assert!(!mapped.thinking_enabled);
+            assert!(mapped.messages.thinking.is_none());
+            assert!(mapped.messages.output_config.is_none());
+            let converted = serde_json::to_value(
+                convert_request(&mapped.messages)
+                    .unwrap()
+                    .conversation_state,
+            )
+            .unwrap();
+            assert!(!converted.to_string().contains("<thinking_mode>"));
+        }
+    }
+
+    #[test]
+    fn family_aliases_extract_default_thinking_without_injecting_it() {
+        for model in [" sonnet ", "OPUS"] {
+            let mapped = map_request(request_with_model(model)).unwrap();
+            assert!(mapped.thinking_enabled);
+            assert!(mapped.messages.thinking.is_none());
+            let mut req = request_with_model(model);
+            req.reasoning = Some(ReasoningConfig {
+                effort: Some("none".into()),
+            });
+            assert!(!map_request(req).unwrap().thinking_enabled);
+        }
+    }
+
+    #[test]
+    fn custom_input_preserves_json_and_empty_strings() {
+        for raw in [r#"{"hello":"world"}"#, "", "await tools.run('你好');\n"] {
+            let mapped = map_request(request(json!([
+                {"type":"custom_tool_call", "call_id":"c1", "name":"exec", "input":raw},
+                {"type":"custom_tool_call_output", "call_id":"c1", "output":"done"}
+            ])))
+            .unwrap();
+            assert_eq!(
+                mapped.messages.messages[0].content[0]["input"],
+                json!({"input":raw})
+            );
+        }
+    }
+
+    #[test]
+    fn custom_output_unwraps_upstream_string_and_alternate_fields() {
+        let raw = "await tools.run();";
+        assert_eq!(custom_tool_input(raw), raw);
+        assert_eq!(custom_tool_input(&json!(raw).to_string()), raw);
+        for field in ["input", "code", "source", "script", "content"] {
+            let mut value = json!({});
+            value[field] = json!(raw);
+            assert_eq!(custom_tool_input(&value.to_string()), raw);
+        }
+    }
+
+    #[test]
+    fn nested_custom_tools_are_deduplicated_with_top_level_precedence() {
+        let mut req = request(json!([
+            {"type":"additional_tools", "tools":[
+                {"type":"custom", "name":"duplicate"},
+                {"type":"namespace", "name":"a", "tools":[
+                    {"type":"namespace", "name":"b", "tools":[
+                        {"type":"custom", "name":"exec", "format":{"type":"text"}}
+                    ]}
+                ]}
+            ]},
+            {"role":"user", "content":"hi"}
+        ]));
+        req.tools = serde_json::from_value(json!([
+            {"type":"function", "name":"duplicate", "description":"first"},
+            {"type":"custom", "name":"exec", "description":"raw input"}
+        ]))
+        .unwrap();
+        req.tool_choice = Some(json!({"type":"custom", "name":"exec"}));
+        let mapped = map_request(req).unwrap();
+        let tools = mapped.messages.tools.as_ref().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].description, "first");
+        assert_eq!(
+            mapped.custom_tool_names,
+            HashSet::from(["exec".to_string()])
+        );
+        assert_eq!(tools[1].input_schema["required"], json!(["input"]));
+        assert_eq!(
+            tools[1].input_schema["properties"]["input"]["type"],
+            "string"
+        );
+        assert_eq!(
+            mapped.messages.tool_choice,
+            Some(json!({"type":"tool", "name":"exec"}))
+        );
+        assert!(convert_request(&mapped.messages).is_ok());
+    }
+
+    #[test]
+    fn stream_and_non_stream_restore_custom_tool_after_name_mapping() {
+        let original_name = format!("exec_{}", "x".repeat(80));
+        let raw = "await tools.run({text: '你好'});\n";
+        let arguments = json!({"input": raw}).to_string();
+        let mut ctx = context();
+        ctx.custom_tool_names.insert(original_name.clone());
+        ctx.tool_name_map
+            .insert("short_exec".into(), original_name.clone());
+        let split = arguments.find("run").unwrap();
+        for (input, stop) in [(&arguments[..split], false), (&arguments[split..], true)] {
+            ctx.process_tool(crate::kiro::model::events::ToolUseEvent {
+                tool_use_id: "call_custom".into(),
+                name: "short_exec".into(),
+                input: input.into(),
+                stop,
+            })
+            .unwrap();
+        }
+        let collected = ctx.collected(String::new(), None);
+        let body = build_response_body("resp_1", &ctx.model, &collected);
+        assert_eq!(body["output"][0]["type"], "custom_tool_call");
+        assert_eq!(body["output"][0]["input"], raw);
+        assert_eq!(body["output"][0]["name"], original_name);
+        assert!(body["output"][0].get("arguments").is_none());
+        let events = ctx.finish_events();
+        assert_eq!(
+            event_types(&events),
+            vec![
+                "response.output_item.added",
+                "response.custom_tool_call_input.delta",
+                "response.custom_tool_call_input.done",
+                "response.output_item.done",
+                "response.completed"
+            ]
+        );
+        let data: Vec<Value> = events
+            .iter()
+            .map(|bytes| {
+                let text = std::str::from_utf8(bytes).unwrap();
+                serde_json::from_str(
+                    text.lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(data[1]["delta"], raw);
+        assert_eq!(data[2]["input"], raw);
+        assert_eq!(data[3]["item"], body["output"][0]);
+        assert_eq!(data[4]["response"]["output"], body["output"]);
+    }
+
     fn request_with_model(model: &str) -> ResponsesRequest {
         serde_json::from_value(json!({"model": model, "input": "hi"})).unwrap()
     }
@@ -2084,6 +2348,7 @@ mod tests {
             max_output_tokens: 4096,
             incomplete_reason: None,
             created_at: 1_700_000_000,
+            custom_tool_names: HashSet::new(),
         }
     }
 
