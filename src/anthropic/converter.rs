@@ -181,7 +181,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
         return size;
     }
 
-    match mapped {
+    match mapped.map(|model| crate::kiro::model_catalog::canonical_model_id(&model)) {
         Some(mapped)
             if mapped == "claude-sonnet-5"
                 || mapped == "claude-fable-5.1"

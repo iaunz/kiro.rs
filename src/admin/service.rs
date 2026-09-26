@@ -8,16 +8,16 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::kiro::model::available_models::UpstreamModel;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
-use super::sso::{
-    SsoError, SsoSessionManager, SsoSessionResponse, StartSsoSessionRequest,
-};
+use super::sso::{SsoError, SsoSessionManager, SsoSessionResponse, StartSsoSessionRequest};
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialModelItem,
+    CredentialModelsResponse, CredentialStatusItem, CredentialsStatusResponse,
+    LoadBalancingModeResponse, SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -257,6 +257,22 @@ impl AdminService {
             usage_percentage,
             next_reset_at: usage.next_date_reset,
         })
+    }
+
+    /// 使用该账号实时获取模型，不回退到公共模型目录。
+    pub async fn get_models(&self, id: u64) -> Result<CredentialModelsResponse, AdminServiceError> {
+        let models = self
+            .token_manager
+            .get_available_models_for(id)
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("凭据不存在") {
+                    AdminServiceError::NotFound { id }
+                } else {
+                    AdminServiceError::UpstreamError(error.to_string())
+                }
+            })?;
+        Ok(credential_models_response(id, models))
     }
 
     /// 添加新凭据
@@ -519,5 +535,111 @@ impl AdminService {
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+}
+
+fn credential_models_response(id: u64, models: Vec<UpstreamModel>) -> CredentialModelsResponse {
+    let mut seen = HashSet::new();
+    let models = models
+        .into_iter()
+        .filter_map(|model| {
+            let normalized = model.model_id.to_ascii_lowercase();
+            if normalized.trim().is_empty() || !seen.insert(normalized.clone()) {
+                return None;
+            }
+            let bare = normalized.strip_prefix("claude-").unwrap_or(&normalized);
+            let is_claude_family = bare
+                .split('-')
+                .next()
+                .is_some_and(|family| matches!(family, "fable" | "sonnet" | "opus" | "haiku"));
+            let thinking_model_id = (is_claude_family && !normalized.ends_with("-thinking"))
+                .then(|| format!("{}-thinking", model.model_id));
+            Some(CredentialModelItem {
+                model_id: model.model_id,
+                thinking_model_id,
+            })
+        })
+        .collect();
+    CredentialModelsResponse { id, models }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn models(ids: &[&str]) -> Vec<UpstreamModel> {
+        ids.iter()
+            .map(|id| serde_json::from_value(json!({ "modelId": id })).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn credential_models_keep_actual_ids_and_expand_only_claude_families() {
+        let response = credential_models_response(
+            42,
+            models(&[
+                "Opus-5.5",
+                "claude-sonnet-5",
+                "fable-5.1",
+                "claude-haiku-4.5",
+                "gpt-5.6-sol",
+                "opusfoo-5",
+                "custom-opus-5",
+            ]),
+        );
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "id": 42,
+                "models": [
+                    {"modelId": "Opus-5.5", "thinkingModelId": "Opus-5.5-thinking"},
+                    {"modelId": "claude-sonnet-5", "thinkingModelId": "claude-sonnet-5-thinking"},
+                    {"modelId": "fable-5.1", "thinkingModelId": "fable-5.1-thinking"},
+                    {"modelId": "claude-haiku-4.5", "thinkingModelId": "claude-haiku-4.5-thinking"},
+                    {"modelId": "gpt-5.6-sol", "thinkingModelId": null},
+                    {"modelId": "opusfoo-5", "thinkingModelId": null},
+                    {"modelId": "custom-opus-5", "thinkingModelId": null}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn credential_models_deduplicate_without_inventing_or_canonicalizing_ids() {
+        let response = credential_models_response(
+            7,
+            models(&[
+                "",
+                " ",
+                "opus-5.5",
+                "opus-5.5",
+                "OPUS-5.5",
+                "claude-opus-5.5",
+                "opus-5.5-thinking",
+                "opus-5.5-thinking",
+                "claude-haiku-4.5-THINKING",
+            ]),
+        );
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "id": 7,
+                "models": [
+                    {"modelId": "opus-5.5", "thinkingModelId": "opus-5.5-thinking"},
+                    {"modelId": "claude-opus-5.5", "thinkingModelId": "claude-opus-5.5-thinking"},
+                    {"modelId": "opus-5.5-thinking", "thinkingModelId": null},
+                    {"modelId": "claude-haiku-4.5-THINKING", "thinkingModelId": null}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn credential_models_return_empty_when_account_has_no_models() {
+        assert_eq!(
+            serde_json::to_value(credential_models_response(9, Vec::new())).unwrap(),
+            json!({"id": 9, "models": []})
+        );
     }
 }

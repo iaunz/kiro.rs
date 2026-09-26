@@ -40,6 +40,15 @@ export interface BalanceResponse {
   nextResetAt: number | null
 }
 
+// 单个凭据实际返回的模型及其 thinking ID
+export interface CredentialModelsResponse {
+  id: number
+  models: {
+    modelId: string
+    thinkingModelId: string | null
+  }[]
+}
+
 // 成功响应
 export interface SuccessResponse {
   success: boolean

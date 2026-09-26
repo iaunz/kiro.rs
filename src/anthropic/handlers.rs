@@ -4,6 +4,7 @@ use std::convert::Infallible;
 
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
+use crate::kiro::model_catalog::canonical_model_id;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
 use anyhow::Error;
@@ -291,9 +292,27 @@ fn static_models() -> Vec<Model> {
 
 fn merge_discovered_models(
     models: &mut Vec<Model>,
-    discovered: Vec<crate::kiro::model::available_models::UpstreamModel>,
+    mut discovered: Vec<crate::kiro::model::available_models::UpstreamModel>,
 ) {
+    // If both spellings are advertised upstream, use the prefixed entry's metadata.
+    discovered.sort_by_key(|model| {
+        canonical_model_id(&model.model_id) != model.model_id.trim().to_ascii_lowercase()
+    });
+    let mut discovered_ids = std::collections::HashSet::new();
     for model in discovered {
+        let id = canonical_model_id(&model.model_id);
+        if !discovered_ids.insert(id.to_ascii_lowercase()) {
+            continue;
+        }
+        let matches_model = |existing: &Model| {
+            let base_id = existing
+                .id
+                .strip_suffix("-thinking")
+                .unwrap_or(&existing.id);
+            canonical_model_id(base_id).eq_ignore_ascii_case(&id)
+                || map_model(&existing.id)
+                    .is_some_and(|mapped| canonical_model_id(&mapped).eq_ignore_ascii_case(&id))
+        };
         let output_limit = model
             .token_limits
             .as_ref()
@@ -302,25 +321,28 @@ fn merge_discovered_models(
             .filter(|limit| *limit > 0)
             .or_else(|| {
                 models.iter().find_map(|existing| {
-                    (map_model(&existing.id).as_deref() == Some(model.model_id.as_str()))
+                    matches_model(existing)
                         .then_some(existing.max_tokens)
                         .flatten()
                 })
             });
         // Update the limits of existing compatibility aliases as well as the exact ID.
         for existing in models.iter_mut() {
-            if map_model(&existing.id).as_deref() == Some(model.model_id.as_str()) {
+            if matches_model(existing) {
                 if let Some(limit) = output_limit {
                     existing.max_tokens = Some(limit);
                 }
             }
         }
-        if models.iter().any(|existing| existing.id == model.model_id) {
+        if models
+            .iter()
+            .any(|existing| existing.id.eq_ignore_ascii_case(&id))
+        {
             continue;
         }
-        let owner = if model.model_id.starts_with("claude-") {
+        let owner = if id.starts_with("claude-") {
             "anthropic"
-        } else if model.model_id.starts_with("gpt-") {
+        } else if id.starts_with("gpt-") {
             "openai"
         } else {
             "kiro"
@@ -329,8 +351,8 @@ fn merge_discovered_models(
             display_name: model
                 .model_name
                 .filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| model.model_id.clone()),
-            id: model.model_id,
+                .unwrap_or_else(|| id.clone()),
+            id,
             object: "model".into(),
             created: 0,
             owned_by: owner.into(),
@@ -338,6 +360,38 @@ fn merge_discovered_models(
             max_tokens: output_limit,
         });
     }
+
+    // Only advertise aliases here; request conversion and thinking behavior stay unchanged.
+    let mut ids: std::collections::HashSet<_> = models
+        .iter()
+        .map(|model| model.id.to_ascii_lowercase())
+        .collect();
+    let mut thinking_models = Vec::new();
+    for model in models.iter() {
+        let model_lower = model.id.to_ascii_lowercase();
+        if model_lower.ends_with("-thinking")
+            || !model_lower.strip_prefix("claude-").is_some_and(|name| {
+                name.split('-')
+                    .next()
+                    .is_some_and(|family| matches!(family, "fable" | "sonnet" | "opus" | "haiku"))
+            })
+        {
+            continue;
+        }
+        let id = format!("{}-thinking", model.id);
+        if ids.insert(id.to_ascii_lowercase()) {
+            thinking_models.push(Model {
+                id,
+                object: model.object.clone(),
+                created: model.created,
+                owned_by: model.owned_by.clone(),
+                display_name: format!("{} (Thinking)", model.display_name),
+                model_type: model.model_type.clone(),
+                max_tokens: model.max_tokens,
+            });
+        }
+    }
+    models.extend(thinking_models);
 }
 
 /// POST /v1/messages
@@ -801,7 +855,9 @@ pub(crate) fn should_extract_thinking(model: &str, thinking: &Option<Thinking>) 
     }
 
     if matches!(
-        map_model(model).as_deref(),
+        map_model(model)
+            .map(|model| canonical_model_id(&model))
+            .as_deref(),
         Some("claude-sonnet-5") | Some("claude-opus-5")
     ) {
         thinking
@@ -830,7 +886,9 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     }
 
     let is_adaptive_thinking = matches!(
-        map_model(&payload.model).as_deref(),
+        map_model(&payload.model)
+            .map(|model| canonical_model_id(&model))
+            .as_deref(),
         Some("claude-opus-4.6")
             | Some("claude-opus-5")
             | Some("claude-sonnet-5")
@@ -864,6 +922,170 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovered_claude_families_advertise_matching_thinking_models() {
+        let mut models = static_models();
+        let discovered = serde_json::from_value(json!([
+            {"modelId":"claude-opus-5.5", "modelName":"Claude Opus 5.5", "tokenLimits":{"maxOutputTokens":128000}},
+            {"modelId":"opus-5.5"},
+            {"modelId":"claude-fable-5.1"},
+            {"modelId":"claude-sonnet-4.6"},
+            {"modelId":"claude-haiku-4.5"},
+            {"modelId":"CLAUDE-SONNET-6"},
+            {"modelId":"auto"},
+            {"modelId":"gpt-5.6-sol"},
+            {"modelId":"minimax-m2.5"},
+            {"modelId":"qwen3-coder-next"},
+            {"modelId":"notfable-1"}
+        ])).unwrap();
+        merge_discovered_models(&mut models, discovered);
+        assert!(!models.iter().any(|model| model.id == "opus-5.5"));
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| model.id == "claude-opus-5.5")
+                .count(),
+            1
+        );
+
+        for id in [
+            "claude-opus-5.5",
+            "claude-fable-5.1",
+            "claude-sonnet-4.6",
+            "claude-haiku-4.5",
+            "claude-sonnet-6",
+        ] {
+            let base = models.iter().find(|model| model.id == id).unwrap();
+            let thinking_id = format!("{id}-thinking");
+            let thinking = models.iter().find(|model| model.id == thinking_id).unwrap();
+            let mut expected = serde_json::to_value(base).unwrap();
+            expected["id"] = json!(thinking_id);
+            expected["display_name"] = json!(format!("{} (Thinking)", base.display_name));
+            assert_eq!(serde_json::to_value(thinking).unwrap(), expected);
+        }
+        for id in [
+            "auto",
+            "gpt-5.6-sol",
+            "minimax-m2.5",
+            "qwen3-coder-next",
+            "notfable-1",
+        ] {
+            assert!(models.iter().any(|model| model.id == id));
+            assert!(
+                !models
+                    .iter()
+                    .any(|model| model.id == format!("{id}-thinking"))
+            );
+        }
+    }
+
+    #[test]
+    fn unprefixed_families_are_listed_with_claude_prefix_and_thinking_variant() {
+        let mut models = static_models();
+        let discovered = serde_json::from_value(json!([
+            {"modelId":"opus-5.5", "tokenLimits":{"maxOutputTokens":128000}},
+            {"modelId":"fable-6.1"},
+            {"modelId":"sonnet-7"},
+            {"modelId":"HAIKU-6"},
+            {"modelId":"custom-opus-1"}
+        ]))
+        .unwrap();
+        merge_discovered_models(&mut models, discovered);
+        for bare in ["opus-5.5", "fable-6.1", "sonnet-7", "haiku-6"] {
+            for suffix in ["", "-thinking"] {
+                let id = format!("claude-{bare}{suffix}");
+                let model = models.iter().find(|model| model.id == id).unwrap();
+                assert_eq!(model.owned_by, "anthropic");
+                assert!(
+                    !models
+                        .iter()
+                        .any(|model| model.id.eq_ignore_ascii_case(&format!("{bare}{suffix}")))
+                );
+            }
+        }
+        assert!(models.iter().any(|model| model.id == "custom-opus-1"));
+        assert!(
+            !models
+                .iter()
+                .any(|model| model.id == "custom-opus-1-thinking")
+        );
+    }
+
+    #[test]
+    fn canonical_discovered_models_merge_both_prefix_forms_independent_of_order() {
+        for reverse in [false, true] {
+            let mut models = static_models();
+            let mut discovered: Vec<crate::kiro::model::available_models::UpstreamModel> = serde_json::from_value(json!([
+                {"modelId":"opus-5.5", "modelName":"Bare Opus", "tokenLimits":{"maxOutputTokens":64000}},
+                {"modelId":"claude-opus-5.5", "modelName":"Canonical Opus", "tokenLimits":{"maxOutputTokens":128000}},
+                {"modelId":"sonnet-5", "tokenLimits":{"maxOutputTokens":32000}},
+                {"modelId":"claude-sonnet-5", "tokenLimits":{"maxOutputTokens":96000}}
+            ])).unwrap();
+            if reverse {
+                discovered.reverse();
+            }
+            merge_discovered_models(&mut models, discovered);
+            for (base, expected_limit) in [("claude-opus-5.5", 128000), ("claude-sonnet-5", 96000)]
+            {
+                for suffix in ["", "-thinking"] {
+                    let id = format!("{base}{suffix}");
+                    assert_eq!(models.iter().filter(|model| model.id == id).count(), 1);
+                    let model = models.iter().find(|model| model.id == id).unwrap();
+                    assert_eq!(model.max_tokens, Some(expected_limit));
+                }
+            }
+            assert_eq!(
+                models
+                    .iter()
+                    .find(|model| model.id == "claude-opus-5.5")
+                    .unwrap()
+                    .display_name,
+                "Canonical Opus"
+            );
+            assert!(
+                !models
+                    .iter()
+                    .any(|model| model.id.starts_with("opus-") || model.id.starts_with("sonnet-"))
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_model_expansion_preserves_existing_entries_without_duplicate_suffixes() {
+        for reverse in [false, true] {
+            let mut models = static_models();
+            let mut discovered: Vec<crate::kiro::model::available_models::UpstreamModel> =
+                serde_json::from_value(json!([
+                    {"modelId":"claude-opus-5.5"},
+                    {"modelId":"CLAUDE-OPUS-5.5-THINKING", "modelName":"Upstream Thinking"},
+                    {"modelId":"claude-sonnet-5"},
+                    {"modelId":"claude-sonnet-5"}
+                ]))
+                .unwrap();
+            if reverse {
+                discovered.reverse();
+            }
+            merge_discovered_models(&mut models, discovered.clone());
+            let first = serde_json::to_value(&models).unwrap();
+            merge_discovered_models(&mut models, discovered);
+            assert_eq!(serde_json::to_value(&models).unwrap(), first);
+            let ids: std::collections::HashSet<_> = models
+                .iter()
+                .map(|model| model.id.to_ascii_lowercase())
+                .collect();
+            assert_eq!(ids.len(), models.len());
+            assert!(!ids.iter().any(|id| id.ends_with("-thinking-thinking")));
+            assert_eq!(
+                models
+                    .iter()
+                    .find(|model| model.id == "claude-opus-5.5-thinking")
+                    .unwrap()
+                    .display_name,
+                "Upstream Thinking"
+            );
+        }
+    }
 
     #[test]
     fn discovered_models_keep_aliases_and_inherit_known_output_limits() {

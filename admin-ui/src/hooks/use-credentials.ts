@@ -6,6 +6,7 @@ import {
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
+  getCredentialModels,
   addCredential,
   deleteCredential,
   getLoadBalancingMode,
@@ -29,6 +30,20 @@ export function useCredentialBalance(id: number | null) {
     queryFn: () => getCredentialBalance(id!),
     enabled: id !== null,
     retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+  })
+}
+
+// 仅在模型对话框挂载或用户手动刷新时查询，每个凭据独立隔离
+export function useCredentialModels(id: number) {
+  return useQuery({
+    queryKey: ['credential-models', id],
+    queryFn: ({ signal }) => getCredentialModels(id, signal),
+    retry: false,
+    gcTime: 0,
+    staleTime: 0,
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
   })
 }
 

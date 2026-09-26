@@ -23,19 +23,47 @@ const MAX_MODEL_PAGES: usize = 100;
 static DISCOVERED_MODELS: LazyLock<RwLock<HashMap<String, UpstreamModel>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// 仅接受上游实际公布的模型 ID，保留上游的拼写。
+/// Claude 家族统一使用 claude- 前缀；版本号、日期及其他模型 ID 保持原样。
+pub fn canonical_model_id(model: &str) -> String {
+    let normalized = model.trim().to_ascii_lowercase();
+    match claude_family_id(&normalized) {
+        Some(id) => format!("claude-{id}"),
+        None => model.to_string(),
+    }
+}
+
+// 只识别完整家族名称或以连字符分隔的后缀，避免将 opus-custom 的规则扩展到 opusfoo。
+fn claude_family_id(model: &str) -> Option<&str> {
+    let bare = model.strip_prefix("claude-").unwrap_or(model);
+    let family = bare.split('-').next()?;
+    matches!(family, "fable" | "sonnet" | "opus" | "haiku").then_some(bare)
+}
+
+fn find_discovered_model<'a>(
+    models: &'a HashMap<String, UpstreamModel>,
+    model: &str,
+) -> Option<&'a UpstreamModel> {
+    let normalized = model.trim().to_ascii_lowercase();
+    if let Some(model) = models.get(&normalized) {
+        return Some(model);
+    }
+    let bare = claude_family_id(&normalized)?;
+    if normalized.starts_with("claude-") {
+        models.get(bare)
+    } else {
+        models.get(&format!("claude-{bare}"))
+    }
+}
+
+/// 接受上游实际公布的模型 ID 及 Claude 前缀别名，保留上游的拼写。
 pub fn discovered_model_id(model: &str) -> Option<String> {
-    DISCOVERED_MODELS
-        .read()
-        .get(&model.trim().to_ascii_lowercase())
-        .map(|model| model.model_id.clone())
+    find_discovered_model(&DISCOVERED_MODELS.read(), model).map(|model| model.model_id.clone())
 }
 
 /// 未公布、无效或超出本地计数范围的限额由调用者使用原有默认值。
 pub fn discovered_context_window(model: &str) -> Option<i32> {
     let models = DISCOVERED_MODELS.read();
-    let limit = models
-        .get(&model.trim().to_ascii_lowercase())?
+    let limit = find_discovered_model(&models, model)?
         .token_limits
         .as_ref()?
         .max_input_tokens?;
@@ -251,6 +279,57 @@ mod tests {
         serde_json::from_value(serde_json::json!({ "modelId": id })).unwrap()
     }
 
+    #[test]
+    fn canonical_model_ids_only_normalize_claude_families() {
+        for (input, expected) in [
+            ("fable-5.1", "claude-fable-5.1"),
+            ("Sonnet-5", "claude-sonnet-5"),
+            ("opus-5.5-thinking", "claude-opus-5.5-thinking"),
+            ("haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
+            (" CLAUDE-OPUS-5.5 ", "claude-opus-5.5"),
+            ("claude-fable-5.1", "claude-fable-5.1"),
+            ("haiku", "claude-haiku"),
+            ("GPT-5.6-Sol", "GPT-5.6-Sol"),
+            ("opusfoo-5.5", "opusfoo-5.5"),
+            ("claude-sonnetish", "claude-sonnetish"),
+            ("amazon-sonnet-5", "amazon-sonnet-5"),
+        ] {
+            assert_eq!(canonical_model_id(input), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn discovered_lookup_only_aliases_claude_family_prefixes() {
+        let models = [
+            model("Opus-99.1"),
+            model("Claude-Sonnet-99.2"),
+            model("Haiku-99.3"),
+            model("Claude-Haiku-99.3"),
+            model("claude-gpt-99.4"),
+            model("opusfoo-99.5"),
+        ]
+        .into_iter()
+        .map(|model| (model.model_id.to_ascii_lowercase(), model))
+        .collect();
+        for (input, expected) in [
+            ("CLAUDE-OPUS-99.1", Some("Opus-99.1")),
+            ("opus-99.1", Some("Opus-99.1")),
+            ("sonnet-99.2", Some("Claude-Sonnet-99.2")),
+            ("claude-sonnet-99.2", Some("Claude-Sonnet-99.2")),
+            ("haiku-99.3", Some("Haiku-99.3")),
+            ("claude-haiku-99.3", Some("Claude-Haiku-99.3")),
+            ("gpt-99.4", None),
+            ("claude-opusfoo-99.5", None),
+            ("claude-opus-99.1-thinking", None),
+        ] {
+            assert_eq!(
+                find_discovered_model(&models, input).map(|model| model.model_id.as_str()),
+                expected,
+                "input: {input}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn cache_reuses_results_and_preserves_them_on_failure() {
         let cache = ModelCatalogCache::default();
@@ -320,6 +399,52 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(discovered_context_window("test-cache-model"), None);
+        }
+
+        // 与唯一写入全局目录的缓存测试共用生命周期，避免并行测试相互覆盖目录。
+        cache.state.lock().await.refresh_after = None;
+        cache
+            .get_or_refresh(|| async {
+                Ok([
+                    ("Opus-99.1", Some(123_000)),
+                    ("Claude-Sonnet-99.2", Some(456_000)),
+                    ("Haiku-99.3", None),
+                    ("Claude-Haiku-99.3", Some(789_000)),
+                ]
+                .into_iter()
+                .map(|(id, limit)| {
+                    let mut discovered = model(id);
+                    discovered.token_limits =
+                        Some(crate::kiro::model::available_models::TokenLimits {
+                            max_input_tokens: limit,
+                            max_output_tokens: None,
+                        });
+                    discovered
+                })
+                .collect())
+            })
+            .await
+            .unwrap();
+        for (input, expected_id, expected_limit) in [
+            ("opus-99.1", "Opus-99.1", Some(123_000)),
+            ("claude-opus-99.1", "Opus-99.1", Some(123_000)),
+            ("sonnet-99.2", "Claude-Sonnet-99.2", Some(456_000)),
+            ("claude-sonnet-99.2", "Claude-Sonnet-99.2", Some(456_000)),
+            ("haiku-99.3", "Haiku-99.3", None),
+            ("claude-haiku-99.3", "Claude-Haiku-99.3", Some(789_000)),
+        ] {
+            assert_eq!(discovered_model_id(input).as_deref(), Some(expected_id));
+            assert_eq!(discovered_context_window(input), expected_limit);
+            for requested in [input.to_string(), format!("{input}-thinking")] {
+                assert_eq!(
+                    crate::anthropic::map_model(&requested).as_deref(),
+                    Some(expected_id)
+                );
+                assert_eq!(
+                    crate::anthropic::get_context_window_size(&requested),
+                    expected_limit.unwrap_or(200_000)
+                );
+            }
         }
     }
 

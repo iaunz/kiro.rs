@@ -1,12 +1,13 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, List } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
+import { CredentialModelsDialog } from '@/components/credential-models-dialog'
 import {
   Dialog,
   DialogContent,
@@ -60,6 +61,7 @@ export function CredentialCard({
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [showModelsDialog, setShowModelsDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -361,6 +363,14 @@ export function CredentialCard({
             </Button>
             <Button
               size="sm"
+              variant="outline"
+              onClick={() => setShowModelsDialog(true)}
+            >
+              <List className="h-4 w-4 mr-1" />
+              获取模型
+            </Button>
+            <Button
+              size="sm"
               variant="destructive"
               onClick={() => setShowDeleteDialog(true)}
               disabled={!credential.disabled}
@@ -372,6 +382,14 @@ export function CredentialCard({
           </div>
         </CardContent>
       </Card>
+
+      {showModelsDialog && (
+        <CredentialModelsDialog
+          key={credential.id}
+          credentialId={credential.id}
+          onOpenChange={setShowModelsDialog}
+        />
+      )}
 
       {/* 删除确认对话框 */}
       <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>

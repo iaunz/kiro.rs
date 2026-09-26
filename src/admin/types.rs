@@ -178,6 +178,25 @@ pub struct BalanceResponse {
     pub next_reset_at: Option<f64>,
 }
 
+// ============ 账号模型查询 ============
+
+/// 指定凭据实时返回的模型 ID，不包含静态或缓存目录中的模型。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialModelsResponse {
+    pub id: u64,
+    pub models: Vec<CredentialModelItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialModelItem {
+    /// 上游返回的原始 ID，不添加 claude- 前缀。
+    pub model_id: String,
+    /// 本项目支持的对应 thinking ID；不支持时为 null。
+    pub thinking_model_id: Option<String>,
+}
+
 // ============ 负载均衡配置 ============
 
 /// 负载均衡模式响应

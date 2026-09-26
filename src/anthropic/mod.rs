@@ -35,3 +35,6 @@ pub mod types;
 mod websearch;
 
 pub use router::create_router_with_provider;
+
+#[cfg(test)]
+pub(crate) use converter::{get_context_window_size, map_model};

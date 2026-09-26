@@ -8,9 +8,9 @@ use axum::{
 use super::{
     handlers::{
         add_credential, cancel_sso_session, delete_credential, force_refresh_token,
-        get_all_credentials, get_credential_balance, get_load_balancing_mode, get_sso_session,
-        reset_failure_count, set_credential_disabled, set_credential_priority,
-        set_load_balancing_mode, start_sso_session,
+        get_all_credentials, get_credential_balance, get_credential_models,
+        get_load_balancing_mode, get_sso_session, reset_failure_count, set_credential_disabled,
+        set_credential_priority, set_load_balancing_mode, start_sso_session,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -26,6 +26,7 @@ use super::{
 /// - `POST /credentials/:id/reset` - 重置失败计数
 /// - `POST /credentials/:id/refresh` - 强制刷新 Token
 /// - `GET /credentials/:id/balance` - 获取凭据余额
+/// - `GET /credentials/:id/models` - 实时获取凭据的模型 ID
 /// - `GET /config/load-balancing` - 获取负载均衡模式
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
 /// - `POST /sso/sessions` - 发起 AWS SSO OIDC 自动导入会话
@@ -48,6 +49,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
+        .route("/credentials/{id}/models", get(get_credential_models))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
@@ -62,4 +64,81 @@ pub fn create_admin_router(state: AdminState) -> Router {
             admin_auth_middleware,
         ))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin::service::AdminService;
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::kiro::token_manager::MultiTokenManager;
+    use crate::model::config::Config;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn credential_models_require_admin_auth_and_report_lookup_errors() {
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![KiroCredentials {
+                    id: Some(7),
+                    disabled: true,
+                    ..Default::default()
+                }],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let before = serde_json::to_value(manager.snapshot()).unwrap();
+        let state = AdminState::new(
+            "test-admin-key",
+            AdminService::new(manager.clone(), Vec::new()),
+        );
+        let app = Router::new().nest("/api/admin", create_admin_router(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let missing_url = format!("http://{address}/api/admin/credentials/99/models");
+
+        for key in [None, Some("wrong-key")] {
+            let mut request = client.get(&missing_url);
+            if let Some(key) = key {
+                request = request.header("x-api-key", key);
+            }
+            assert_eq!(
+                request.send().await.unwrap().status(),
+                reqwest::StatusCode::UNAUTHORIZED
+            );
+        }
+        for request in [
+            client
+                .get(&missing_url)
+                .header("x-api-key", "test-admin-key"),
+            client.get(&missing_url).bearer_auth("test-admin-key"),
+        ] {
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+            assert_eq!(
+                response.json::<serde_json::Value>().await.unwrap()["error"]["type"],
+                "not_found"
+            );
+        }
+        let response = client
+            .get(format!("http://{address}/api/admin/credentials/7/models"))
+            .bearer_auth("test-admin-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+        let body = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(body["error"]["type"], "api_error");
+        assert!(body.get("models").is_none());
+        assert_eq!(serde_json::to_value(manager.snapshot()).unwrap(), before);
+        server.abort();
+    }
 }

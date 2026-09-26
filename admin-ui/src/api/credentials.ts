@@ -3,6 +3,7 @@ import { storage } from '@/lib/storage'
 import type {
   CredentialsStatusResponse,
   BalanceResponse,
+  CredentialModelsResponse,
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
@@ -78,6 +79,18 @@ export async function forceRefreshToken(
 // 获取凭据余额
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+  return data
+}
+
+// 仅获取指定凭据的真实模型列表；关闭对话框时可取消请求
+export async function getCredentialModels(
+  id: number,
+  signal?: AbortSignal
+): Promise<CredentialModelsResponse> {
+  const { data } = await api.get<CredentialModelsResponse>(`/credentials/${id}/models`, { signal })
+  if (data.id !== id) {
+    throw new Error('返回的模型列表与当前凭据不匹配，请重试')
+  }
   return data
 }
 

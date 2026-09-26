@@ -888,7 +888,9 @@ fn map_reasoning(
         return Ok((None, None));
     }
     let default_adaptive = matches!(
-        map_model(model).as_deref(),
+        map_model(model)
+            .map(|model| crate::kiro::model_catalog::canonical_model_id(&model))
+            .as_deref(),
         Some("claude-sonnet-5" | "claude-opus-5" | "claude-fable-5.1")
     );
     let suffix_enabled = model_lower.contains("thinking");

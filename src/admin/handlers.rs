@@ -83,6 +83,18 @@ pub async fn get_credential_balance(
     }
 }
 
+/// GET /api/admin/credentials/:id/models
+/// 实时获取指定账号的模型和对应 thinking 模型 ID。
+pub async fn get_credential_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.get_models(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials
 /// 添加新凭据
 pub async fn add_credential(

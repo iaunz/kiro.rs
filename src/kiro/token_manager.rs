@@ -19,12 +19,14 @@ use std::time::{Duration as StdDuration, Instant};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::kiro_version::{USAGE_API_AWS_SDK_VERSION, USAGE_API_KIRO_VERSION};
 use crate::kiro::machine_id;
+use crate::kiro::model::available_models::UpstreamModel;
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::model_catalog::fetch_available_models;
 use crate::model::config::Config;
 
 /// 检查 Token 是否在指定时间内过期
@@ -1808,6 +1810,38 @@ impl MultiTokenManager {
         self.resolve_profile_arn_for(id, &token).await
     }
 
+    /// 取得指定凭据的调用上下文，允许人工查询禁用凭据，不参与凭据轮转。
+    async fn context_for_id(&self, id: u64) -> anyhow::Result<CallContext> {
+        let token = self.valid_token_for(id).await?;
+        let credentials = self
+            .entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.credentials.clone())
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+        Ok(CallContext {
+            id,
+            credentials,
+            token,
+        })
+    }
+
+    /// 实时查询指定凭据的真实模型目录，不使用公共目录缓存或其他凭据。
+    pub async fn get_available_models_for(&self, id: u64) -> anyhow::Result<Vec<UpstreamModel>> {
+        tokio::time::timeout(StdDuration::from_secs(30), async {
+            let mut ctx = self.context_for_id(id).await?;
+            if let Some(arn) = self.resolve_profile_arn_for(id, &ctx.token).await? {
+                ctx.credentials.profile_arn = Some(arn);
+            }
+            let effective_proxy = ctx.credentials.effective_proxy(self.proxy.as_ref());
+            let client = build_client(effective_proxy.as_ref(), 30, self.config.tls_backend)?;
+            fetch_available_models(&client, &ctx.credentials, &self.config, &ctx.token).await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("获取凭据 #{} 的 Kiro 模型超时", id))?
+    }
+
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
         let token = self.valid_token_for(id).await?;
@@ -2155,6 +2189,131 @@ impl Drop for MultiTokenManager {
 mod tests {
     use super::*;
     use crate::kiro::model::credentials::{BUILDER_ID_PROFILE_ARN, SOCIAL_PROFILE_ARN};
+
+    #[tokio::test]
+    async fn manual_model_context_is_bound_to_requested_disabled_credential() {
+        let active = KiroCredentials {
+            id: Some(1),
+            kiro_api_key: Some("ksk_other_account".into()),
+            ..Default::default()
+        };
+        let disabled = KiroCredentials {
+            id: Some(2),
+            disabled: true,
+            access_token: Some("requested-account-token".into()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            api_region: Some("eu-west-1".into()),
+            profile_arn: Some("arn:test:requested-account".into()),
+            proxy_url: Some("http://127.0.0.1:9876".into()),
+            ..Default::default()
+        };
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![active, disabled],
+            Some(ProxyConfig::new("http://127.0.0.1:9877")),
+            None,
+            false,
+        )
+        .unwrap();
+        let before = serde_json::to_value(manager.snapshot()).unwrap();
+
+        let ctx = manager.context_for_id(2).await.unwrap();
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.credentials.id, Some(2));
+        assert_eq!(ctx.token, "requested-account-token");
+        assert_eq!(ctx.credentials.api_region.as_deref(), Some("eu-west-1"));
+        assert_eq!(
+            ctx.credentials.profile_arn.as_deref(),
+            Some("arn:test:requested-account")
+        );
+        assert_eq!(
+            ctx.credentials
+                .effective_proxy(manager.proxy.as_ref())
+                .unwrap()
+                .url,
+            "http://127.0.0.1:9876"
+        );
+        assert_eq!(
+            manager.context_for_id(1).await.unwrap().token,
+            "ksk_other_account"
+        );
+        assert!(
+            manager
+                .get_available_models_for(99)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("凭据不存在")
+        );
+        assert_eq!(serde_json::to_value(manager.snapshot()).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn manual_model_lookup_uses_requested_proxy_and_does_not_rotate_on_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let selected_proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let selected_addr = selected_proxy.local_addr().unwrap();
+        let other_proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_addr = other_proxy.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (mut socket, _) = selected_proxy.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            let count = socket.read(&mut buffer).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&buffer[..count]).into_owned()
+        });
+        let credentials = vec![
+            KiroCredentials {
+                id: Some(1),
+                kiro_api_key: Some("ksk_other_account".into()),
+                ..Default::default()
+            },
+            KiroCredentials {
+                id: Some(2),
+                kiro_api_key: Some("ksk_selected_account".into()),
+                disabled: true,
+                api_region: Some("eu-west-1".into()),
+                proxy_url: Some(format!("http://{selected_addr}")),
+                ..Default::default()
+            },
+        ];
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            credentials,
+            Some(ProxyConfig::new(format!("http://{other_addr}"))),
+            None,
+            false,
+        )
+        .unwrap();
+        let before = serde_json::to_value(manager.snapshot()).unwrap();
+        let result = tokio::time::timeout(
+            StdDuration::from_secs(3),
+            manager.get_available_models_for(2),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_err(),
+            "上游失败必须返回错误，不能返回静态或其他账号模型"
+        );
+        let request = proxy_task.await.unwrap();
+        assert!(
+            request.starts_with("CONNECT q.eu-west-1.amazonaws.com:443 "),
+            "{request}"
+        );
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(50), other_proxy.accept())
+                .await
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(manager.snapshot()).unwrap(), before);
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {

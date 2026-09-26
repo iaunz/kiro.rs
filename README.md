@@ -533,7 +533,9 @@ GPT-5.6 也接受 `gpt-5-6-*` 和 `openai.gpt-5.6-*` 写法。Claude 历史模�
 
 目录查询会合并上游分页，复用当前凭据的 Token、API Region、代理和 profile ARN 处理；HTTP 查询使用 `profileArn` 参数，推理请求保留本地 profile ARN 解析与注入规则。查询优先使用配置的 API Region，遇到 403 时尝试兼容区域回退。
 
-成功获取后，客户端可以使用目录公布的新模型 ID。查询忽略大小写，但发送上游时保留目录中的原始 ID；不把任意未知模型名称直接转发。未发现且不满足静态兼容映射的名称会被拒绝。静态 Claude 历史别名规则仍然生效。
+成功获取后，客户端可以使用目录公布的新模型 ID。Fable、Sonnet、Opus、Haiku 系列在列表中统一使用 `claude-` 前缀：例如上游的 `opus-5.5` 展示为 `claude-opus-5.5`，两种写法同时存在时合并为一项并优先采用带前缀条目的元数据，版本号保持不变。请求可使用带前缀或不带前缀的名称，先精确匹配上游 ID，再查找对应的另一种写法；上下文限额使用同一映射。查询忽略大小写，发送上游时保留实际 ID。其他系列不追加前缀，未发现且不满足静态兼容映射的名称会被拒绝。静态 Claude 历史别名规则仍然生效。
+
+目录中的 Fable、Sonnet、Opus、Haiku 模型会同时提供 `-thinking` 条目，例如 `claude-opus-5.5` 与 `claude-opus-5.5-thinking`。新增条目沿用基础模型的元数据和输出上限，已有条目不会重复添加；请求的 thinking 处理逻辑保持不变。
 
 动态目录与静态兼容项合并展示，静态项不代表当前账户一定有权限。目录来自本次选中的凭据，并非所有凭据的权限并集，也不对多凭据建立按模型分配策略。缓存只保存在内存，重启后重新获取；刚启动时可先调用 `/v1/models`，待发现完成后再使用新模型 ID。
 
@@ -559,9 +561,12 @@ GPT-5.6 也接受 `gpt-5-6-*` 和 `openai.gpt-5.6-*` 写法。Claude 历史模�
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+  - `GET /api/admin/credentials/:id/models` - 使用指定凭据实时获取该账号的模型 ID
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
+
+每个凭据卡片的“获取模型”会单独查询该账号，展示上游实际返回的模型 ID，以及 Fable、Sonnet、Opus、Haiku 对应的 `-thinking` ID。这里保留上游 ID 的原始拼写，不混入 `/v1/models` 的静态兼容项，也不使用其他账号或全局目录的缓存结果。查询失败时显示错误；已禁用的凭据也可查询，操作不会重新启用凭据。
 
 ## 注意事项
 
