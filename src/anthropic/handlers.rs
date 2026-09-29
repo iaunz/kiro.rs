@@ -35,6 +35,16 @@ use super::websearch;
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
 
+    // Kiro 图片恢复失败仍是请求错误，保留原因，避免客户端把它当成瞬态 502 重试。
+    if err_str.contains("IMAGE_DIMENSION_EXCEEDED") {
+        tracing::warn!("上游图片尺寸限制无法自动恢复: {}", err);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", err_str)),
+        )
+            .into_response();
+    }
+
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
@@ -922,6 +932,19 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn image_dimension_errors_preserve_the_kiro_reason_as_http_400() {
+        let message = r#"流式 API 请求失败: 400 Bad Request {"reason":"IMAGE_DIMENSION_EXCEEDED","message":"max allowed size for many-image requests: 2000 pixels"}"#;
+        let response = map_provider_error(anyhow::anyhow!(message));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["message"], message);
+    }
 
     #[test]
     fn discovered_claude_families_advertise_matching_thinking_models() {

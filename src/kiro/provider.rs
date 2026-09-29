@@ -13,6 +13,7 @@ use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+use crate::kiro::image_recovery::{image_dimension_limit, resize_request_images};
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::UpstreamModel;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -369,6 +370,7 @@ impl KiroProvider {
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
     /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
     /// - 硬上限 9 次，避免无限重试
+    /// - Kiro 明确报告图片尺寸上限时，仅追加一次同上下文恢复请求，不重置普通重试预算
     async fn call_api_with_retry(
         &self,
         request_body: &str,
@@ -379,11 +381,14 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
+        // 仅在 Kiro 明确拒绝图片尺寸后尝试一次恢复，首次请求保持原样。
+        let mut image_recovery_attempted = false;
+        let mut recovered_request_body: Option<String> = None;
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
 
-        for attempt in 0..max_retries {
+        'attempts: for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
@@ -416,45 +421,70 @@ impl KiroProvider {
             };
 
             let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
+            let client = self.client_for(&ctx.credentials)?;
+            let (status, body) = loop {
+                let effective_body = recovered_request_body.as_deref().unwrap_or(request_body);
+                let body = endpoint.transform_api_body(effective_body, &rctx);
+                let base = client
+                    .post(&url)
+                    .body(body)
+                    .header("content-type", "application/json")
+                    .header("Connection", "close");
+                let request = endpoint.decorate_api(base, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
-                .post(&url)
-                .body(body)
-                .header("content-type", "application/json")
-                .header("Connection", "close");
-            let request = endpoint.decorate_api(base, &rctx);
-
-            let response = match request.send().await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    tracing::warn!(
-                        "API 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
-                        max_retries,
-                        e
-                    );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
+                let response = match request.send().await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        tracing::warn!(
+                            "API 请求发送失败（尝试 {}/{}）: {}",
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        // 保留原网络重试预算，不因图片恢复重新调度或重置预算。
+                        last_error = Some(e.into());
+                        if attempt + 1 < max_retries {
+                            sleep(Self::retry_delay(attempt)).await;
+                        }
+                        continue 'attempts;
                     }
-                    continue;
+                };
+
+                let status = response.status();
+                if status.is_success() {
+                    self.token_manager.report_success(ctx.id);
+                    return Ok(response);
                 }
+
+                let mut body = response.text().await.unwrap_or_default();
+                if !image_recovery_attempted {
+                    if let Some(limit) = image_dimension_limit(status, &body) {
+                        image_recovery_attempted = true;
+                        match resize_request_images(effective_body.to_owned(), limit).await {
+                            Ok(Some(resized)) => {
+                                recovered_request_body = Some(resized);
+                                tracing::warn!(
+                                    credential_id = ctx.id,
+                                    max_dimension = limit,
+                                    "Kiro 拒绝图片尺寸，按返回上限缩小图片并使用同一凭据重试一次"
+                                );
+                                // 此循环保留 ctx、token、endpoint 和 client，不计凭据失败。
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    credential_id = ctx.id,
+                                    %error,
+                                    "图片尺寸恢复失败，保留 Kiro 原始错误"
+                                );
+                                body.push_str(&format!("；自动图片缩放失败: {error}"));
+                            }
+                        }
+                    }
+                }
+                break (status, body);
             };
-
-            let status = response.status();
-
-            // 成功响应
-            if status.is_success() {
-                self.token_manager.report_success(ctx.id);
-                return Ok(response);
-            }
-
-            // 失败响应：读取 body 用于日志/错误信息
-            let body = response.text().await.unwrap_or_default();
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -611,5 +641,358 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, io::Cursor};
+
+    use axum::{Router, extract::State, http::HeaderMap, routing::post};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use image::{DynamicImage, ImageFormat};
+    use reqwest::{RequestBuilder, StatusCode};
+    use serde_json::{Value, json};
+    use tokio::{net::TcpListener, task::JoinHandle};
+
+    use super::*;
+    use crate::model::config::Config;
+
+    const DIMENSION_ERROR: &str = r#"{"message":"messages.72.content.1.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 2000 pixels","reason":"IMAGE_DIMENSION_EXCEEDED"}"#;
+
+    struct MockEndpoint(String);
+
+    impl KiroEndpoint for MockEndpoint {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
+        fn api_url(&self, _: &RequestContext<'_>) -> String {
+            self.0.clone()
+        }
+
+        fn mcp_url(&self, _: &RequestContext<'_>) -> String {
+            self.0.clone()
+        }
+
+        fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
+            req.bearer_auth(ctx.token)
+                .header("x-test-machine-id", ctx.machine_id)
+        }
+
+        fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
+            self.decorate_api(req, ctx)
+        }
+
+        fn transform_api_body(&self, body: &str, _: &RequestContext<'_>) -> String {
+            body.to_owned()
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockState {
+        requests: Arc<Mutex<Vec<(HeaderMap, String)>>>,
+        responses: Arc<Mutex<VecDeque<(StatusCode, String)>>>,
+        manager: Arc<MultiTokenManager>,
+        change_priority: bool,
+    }
+
+    async fn receive_request(
+        State(state): State<MockState>,
+        headers: HeaderMap,
+        body: String,
+    ) -> (StatusCode, String) {
+        let mut requests = state.requests.lock();
+        requests.push((headers, body));
+        // 如果图片恢复错误地重新 acquire_context，balanced 模式会改用凭据 2。
+        if state.change_priority && requests.len() == 1 {
+            state.manager.set_priority(1, 100).unwrap();
+        }
+        state
+            .responses
+            .lock()
+            .pop_front()
+            .unwrap_or((StatusCode::BAD_REQUEST, "unexpected extra request".into()))
+    }
+
+    struct MockServer {
+        provider: KiroProvider,
+        state: MockState,
+        task: JoinHandle<()>,
+    }
+
+    impl MockServer {
+        async fn start(responses: Vec<(StatusCode, String)>, change_priority: bool) -> Self {
+            let credentials = (1..=2)
+                .map(|id| KiroCredentials {
+                    id: Some(id),
+                    kiro_api_key: Some(format!("ksk_test_{id}")),
+                    machine_id: Some(format!("test-machine-{id}")),
+                    subscription_title: Some("KIRO PRO".into()),
+                    priority: id as u32 - 1,
+                    ..Default::default()
+                })
+                .collect();
+            let mut config = Config::default();
+            config.load_balancing_mode = "balanced".into();
+            let manager =
+                Arc::new(MultiTokenManager::new(config, credentials, None, None, false).unwrap());
+            let state = MockState {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                responses: Arc::new(Mutex::new(responses.into())),
+                manager: manager.clone(),
+                change_priority,
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let router = Router::new()
+                .route("/", post(receive_request))
+                .with_state(state.clone());
+            let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let endpoint: Arc<dyn KiroEndpoint> =
+                Arc::new(MockEndpoint(format!("http://{address}/")));
+            let provider = KiroProvider::with_proxy(
+                manager,
+                None,
+                HashMap::from([("mock".into(), endpoint)]),
+                "mock".into(),
+            );
+            provider.client_cache.lock().insert(
+                None,
+                Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap(),
+            );
+            Self {
+                provider,
+                state,
+                task,
+            }
+        }
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn png(width: u32, height: u32) -> Value {
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(width, height)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+        json!({"format":"png", "source":{"bytes":STANDARD.encode(bytes.into_inner())}})
+    }
+
+    fn image_request(large: bool) -> String {
+        let edge = if large { 2501 } else { 2000 };
+        json!({
+            "profileArn":"arn:test:original",
+            "conversationState":{
+                "conversationId":"same-conversation",
+                "currentMessage":{"userInputMessage":{
+                    "modelId":"opus-5.5", "content":"Continue", "images":[png(edge, 4)],
+                    "userInputMessageContext":{
+                        "tools":[{"toolSpecification":{"name":"screenshot", "description":"Capture", "inputSchema":{"json":{"type":"object"}}}}],
+                        "toolResults":[{"toolUseId":"shot-2","content":[{"text":"Captured"}]}]
+                    }
+                }},
+                "history":[
+                    {"userInputMessage":{"content":"First screenshot", "modelId":"opus-5.5", "images":[png(4, edge)]}},
+                    {"assistantResponseMessage":{"content":"Inspecting", "toolUses":[{"toolUseId":"shot-2", "name":"screenshot", "input":{}}]}}
+                ]
+            }
+        })
+        .to_string()
+    }
+
+    fn image_paths() -> [&'static str; 2] {
+        [
+            "/conversationState/currentMessage/userInputMessage/images/0",
+            "/conversationState/history/0/userInputMessage/images/0",
+        ]
+    }
+
+    #[tokio::test]
+    async fn image_recovery_only_after_kiro_rejection_preserves_context_and_credential() {
+        for is_stream in [false, true] {
+            let server = MockServer::start(
+                vec![
+                    (StatusCode::BAD_REQUEST, DIMENSION_ERROR.into()),
+                    (StatusCode::OK, "ok".into()),
+                ],
+                true,
+            )
+            .await;
+            let original = image_request(true);
+            let response = server
+                .provider
+                .call_api_with_retry(&original, is_stream)
+                .await
+                .unwrap();
+            assert_eq!(response.text().await.unwrap(), "ok");
+            let requests = server.state.requests.lock();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].1, original, "首次请求不能预先修改图片");
+            assert_eq!(requests[0].0["authorization"], "Bearer ksk_test_1");
+            assert_eq!(
+                requests[1].0["authorization"],
+                requests[0].0["authorization"]
+            );
+            assert_eq!(
+                requests[1].0["x-test-machine-id"],
+                requests[0].0["x-test-machine-id"]
+            );
+            let mut expected: Value = serde_json::from_str(&original).unwrap();
+            let mut recovered: Value = serde_json::from_str(&requests[1].1).unwrap();
+            for path in image_paths() {
+                let image = recovered.pointer(path).unwrap();
+                let bytes = STANDARD
+                    .decode(image["source"]["bytes"].as_str().unwrap())
+                    .unwrap();
+                let decoded = image::load_from_memory(&bytes).unwrap();
+                assert!(decoded.width() <= 2000 && decoded.height() <= 2000);
+                *expected.pointer_mut(path).unwrap() = Value::Null;
+                *recovered.pointer_mut(path).unwrap() = Value::Null;
+            }
+            assert_eq!(
+                recovered, expected,
+                "图片以外的历史、工具与请求字段必须保留"
+            );
+            let entries = server.state.manager.snapshot().entries;
+            assert_eq!(entries[0].failure_count, 0);
+            assert_eq!(entries[0].success_count, 1);
+            assert_eq!(entries[1].success_count, 0);
+            assert!(entries.iter().all(|entry| !entry.disabled));
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_images_are_not_resized() {
+        let server = MockServer::start(vec![(StatusCode::OK, "ok".into())], false).await;
+        let original = format!(" {} ", image_request(true));
+        server.provider.call_api(&original).await.unwrap();
+        let requests = server.state.requests.lock();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1, original);
+    }
+
+    #[tokio::test]
+    async fn repeated_image_rejection_is_not_retried_or_counted_as_credential_failure() {
+        let server = MockServer::start(
+            vec![(StatusCode::BAD_REQUEST, DIMENSION_ERROR.into()); 2],
+            false,
+        )
+        .await;
+        let error = server
+            .provider
+            .call_api_stream(&image_request(true))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("IMAGE_DIMENSION_EXCEEDED"));
+        assert_eq!(server.state.requests.lock().len(), 2);
+        assert!(server.state.manager.snapshot().entries.iter().all(|entry| {
+            entry.failure_count == 0 && entry.success_count == 0 && !entry.disabled
+        }));
+    }
+
+    #[tokio::test]
+    async fn unrelated_or_unrecoverable_image_errors_are_not_retried() {
+        for (body, request) in [
+            (
+                DIMENSION_ERROR.replace("IMAGE_DIMENSION_EXCEEDED", "OTHER_REASON"),
+                image_request(true),
+            ),
+            (
+                json!({"reason":"IMAGE_DIMENSION_EXCEEDED", "message":"image too large"})
+                    .to_string(),
+                image_request(true),
+            ),
+            (DIMENSION_ERROR.into(), image_request(false)),
+            (DIMENSION_ERROR.into(), r#"{"conversationState":{}}"#.into()),
+        ] {
+            let server =
+                MockServer::start(vec![(StatusCode::BAD_REQUEST, body.clone())], false).await;
+            let error = server.provider.call_api_stream(&request).await.unwrap_err();
+            assert!(error.to_string().contains(&body));
+            assert_eq!(server.state.requests.lock().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn image_recovery_keeps_normal_transient_retry_policy() {
+        let server = MockServer::start(
+            vec![
+                (StatusCode::BAD_REQUEST, DIMENSION_ERROR.into()),
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "temporarily unavailable".into(),
+                ),
+                (StatusCode::OK, "ok".into()),
+            ],
+            false,
+        )
+        .await;
+        server
+            .provider
+            .call_api(&image_request(true))
+            .await
+            .unwrap();
+        let requests = server.state.requests.lock();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1].1, requests[2].1, "正常重试应复用已恢复的图片");
+    }
+
+    #[tokio::test]
+    async fn image_recovery_is_attempted_once_across_normal_retries() {
+        let server = MockServer::start(
+            vec![
+                (StatusCode::BAD_REQUEST, DIMENSION_ERROR.into()),
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "temporarily unavailable".into(),
+                ),
+                (
+                    StatusCode::BAD_REQUEST,
+                    DIMENSION_ERROR.replace("2000 pixels", "1000 pixels"),
+                ),
+            ],
+            false,
+        )
+        .await;
+        let error = server
+            .provider
+            .call_api(&image_request(true))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("1000 pixels"));
+        let requests = server.state.requests.lock();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1].1, requests[2].1);
+    }
+
+    #[tokio::test]
+    async fn failed_image_decode_preserves_kiro_error_with_safe_context() {
+        let server = MockServer::start(
+            vec![(StatusCode::BAD_REQUEST, DIMENSION_ERROR.into())],
+            false,
+        )
+        .await;
+        let mut request: Value = serde_json::from_str(&image_request(true)).unwrap();
+        request.pointer_mut(image_paths()[0]).unwrap()["source"]["bytes"] =
+            json!("invalid-base64-private-image-content");
+        let error = server
+            .provider
+            .call_api(&request.to_string())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(DIMENSION_ERROR));
+        assert!(error.contains("自动图片缩放失败"));
+        assert!(!error.contains("private-image-content"));
+        assert_eq!(server.state.requests.lock().len(), 1);
     }
 }

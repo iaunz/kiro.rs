@@ -507,6 +507,8 @@ Anthropic Messages 接收工具定义与 `tool_use` / `tool_result` 历史：
 
 `tool_result.content` 可同时包含 `text` 和 `image` 块。PNG、JPEG、GIF、WebP 的 Base64 图片会加入对应的 Kiro 用户消息，文本与工具执行状态继续保留；当前轮与历史轮的工具结果均适用。图片来源需使用 `source.type: "base64"`，不自动下载 URL 图片。
 
+图片限制以 Kiro 实际响应为准，不套用 Claude 的图片数量门槛。首次请求保留原图；仅在 Kiro 返回 HTTP 400、`IMAGE_DIMENSION_EXCEEDED` 且错误中明确给出像素上限时（例如 `max allowed size for many-image requests: 2000 pixels`），才检查当前及历史消息中的全部图片，将超限图片等比例缩小至该上限，再使用同一凭据和端点重试一次。合规图片保留原始编码，历史图片不会丢弃；未知错误或未给出明确尺寸时不猜测限制。PNG、JPEG、WebP 缩放后保留格式；超限 GIF 使用首帧并转为 PNG。图片处理在后台工作线程执行，无法处理或重试仍失败会明确返回错误，不无限重试。文件字节大小限制与像素尺寸限制分别处理，本功能不自动压缩文件大小。
+
 ## 模型映射
 
 Messages 与 Responses 共用模型映射。名称忽略大小写和两端空白；Claude 的显式版本可使用点号或连字符形式。

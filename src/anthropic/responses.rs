@@ -1216,6 +1216,12 @@ fn response_snapshot(
 
 fn map_provider_error(error: Error) -> Response {
     let message = error.to_string();
+    if message.contains("IMAGE_DIMENSION_EXCEEDED") {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            RequestError::new(message, "input"),
+        );
+    }
     if message.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -1912,6 +1918,20 @@ fn build_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn image_dimension_errors_preserve_the_kiro_reason_as_http_400() {
+        let message = r#"API 请求失败: 400 Bad Request {"reason":"IMAGE_DIMENSION_EXCEEDED","message":"max allowed size for many-image requests: 2000 pixels"}"#;
+        let response = map_provider_error(anyhow::anyhow!(message));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["message"], message);
+        assert_eq!(body["error"]["param"], "input");
+    }
 
     fn request(input: Value) -> ResponsesRequest {
         serde_json::from_value(json!({

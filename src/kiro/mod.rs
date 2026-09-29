@@ -1,6 +1,8 @@
 //! Kiro API 客户端模块
 
 pub mod endpoint;
+pub(crate) mod image_normalization;
+mod image_recovery;
 pub mod kiro_version;
 pub mod machine_id;
 pub mod model;

@@ -27,6 +27,8 @@
 
 mod converter;
 mod handlers;
+#[cfg(test)]
+mod image_normalization_tests;
 mod middleware;
 mod responses;
 mod router;
