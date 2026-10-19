@@ -891,7 +891,13 @@ fn map_reasoning(
         map_model(model)
             .map(|model| crate::kiro::model_catalog::canonical_model_id(&model))
             .as_deref(),
-        Some("claude-sonnet-5" | "claude-opus-5" | "claude-fable-5.1")
+        Some(
+            "claude-sonnet-5"
+                | "claude-opus-5"
+                | "claude-fable-5.1"
+                | "claude-sonnet-5.5"
+                | "claude-opus-5.5"
+        )
     );
     let suffix_enabled = model_lower.contains("thinking");
     let effort = reasoning.and_then(|reasoning| reasoning.effort);
@@ -2190,6 +2196,48 @@ mod tests {
         let mapped = map_request(request_with_model("claude-opus-4-8-thinking")).unwrap();
         assert!(mapped.thinking_enabled);
         assert_eq!(mapped.messages.thinking.unwrap().thinking_type, "enabled");
+    }
+
+    #[test]
+    fn new_models_reach_upstream_through_responses() {
+        for model in [
+            "auto",
+            "deepseek-3.2",
+            "minimax-m2.5",
+            "minimax-m2.1",
+            "glm-5",
+            "qwen3-coder-next",
+            "kimi-k3",
+        ] {
+            let mapped = map_request(request_with_model(model)).unwrap();
+            let state = convert_request(&mapped.messages)
+                .unwrap()
+                .conversation_state;
+            assert_eq!(state.current_message.user_input_message.model_id, model);
+            assert!(mapped.messages.thinking.is_none());
+        }
+        for base in ["claude-opus-5.5", "claude-sonnet-5.5"] {
+            for suffix in ["", "-thinking"] {
+                let mapped = map_request(request_with_model(&format!("{base}{suffix}"))).unwrap();
+                let state = convert_request(&mapped.messages)
+                    .unwrap()
+                    .conversation_state;
+                assert_eq!(state.current_message.user_input_message.model_id, base);
+                assert!(mapped.thinking_enabled);
+                assert_eq!(
+                    mapped
+                        .messages
+                        .thinking
+                        .as_ref()
+                        .map(|t| t.thinking_type.as_str()),
+                    if suffix.is_empty() {
+                        None
+                    } else {
+                        Some("adaptive")
+                    }
+                );
+            }
+        }
     }
 
     #[test]

@@ -524,10 +524,15 @@ Messages 与 Responses 共用模型映射。名称忽略大小写和两端空白
 | `claude-opus-4-6` / `4-7` / `4-8` | 对应的 `claude-opus-4.6` / `4.7` / `4.8` | 1,000,000 |
 | `claude-opus-4-5` | `claude-opus-4.5` | 200,000 |
 | `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` | 同名模型 | 272,000 |
+| `claude-opus-5.5` / `claude-sonnet-5.5`（含 `-thinking`、`5-5` 写法） | 对应的 `claude-opus-5.5` / `claude-sonnet-5.5` | 200,000（通用兜底） |
+| `auto` | `auto` | 200,000（通用兜底） |
+| `deepseek-3.2`、`minimax-m2.5`、`minimax-m2.1`、`glm-5`、`qwen3-coder-next`、`kimi-k3` | 同名模型 | 200,000（通用兜底） |
 
 GPT-5.6 也接受 `gpt-5-6-*` 和 `openai.gpt-5.6-*` 写法。Claude 历史模糊别名仍保留兼容逻辑：未指定可识别版本的 Sonnet、Opus 分别回退到 4.5、4.6；仅精确裸别名 `sonnet`、`opus` 指向 5。因此 `claude-opus-4-20250514` 不会因为日期包含 `5` 而映射到 Opus 5。
 
 表中的上下文窗口是本地兜底值；若动态目录提供有效的 `maxInputTokens`，优先使用上游值。`GET /v1/models` 的 `max_tokens` 是输出上限，与此表的上下文窗口不同；新模型未公布输出上限且没有静态兼容值时，省略该字段。
+
+上述新增模型已加入静态兼容列表，启动后无需等待目录发现即可请求；Claude 5.5 保留版本号，不再回退到 5，thinking 行为沿用 5 的兼容处理。通用兜底值仅用于本地上下文用量估算，不代表上游实际限额；模型是否可用仍取决于当前凭据的上游权限。
 
 ### 自动获取 Kiro 模型
 

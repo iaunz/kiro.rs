@@ -273,9 +273,11 @@ fn static_models() -> Vec<Model> {
         },
     ];
 
-    for (id, name) in [
-        ("claude-sonnet-5", "Claude Sonnet 5"),
-        ("claude-fable-5-1", "Claude Fable 5.1"),
+    for (id, name, max_tokens) in [
+        ("claude-opus-5.5", "Claude Opus 5.5", None),
+        ("claude-sonnet-5.5", "Claude Sonnet 5.5", None),
+        ("claude-sonnet-5", "Claude Sonnet 5", Some(128_000)),
+        ("claude-fable-5-1", "Claude Fable 5.1", Some(128_000)),
     ] {
         for thinking in [false, true] {
             models.push(Model {
@@ -293,9 +295,29 @@ fn static_models() -> Vec<Model> {
                     name.into()
                 },
                 model_type: "chat".into(),
-                max_tokens: Some(128_000),
+                max_tokens,
             });
         }
+    }
+    for (id, name) in [
+        ("auto", "Auto"),
+        ("deepseek-3.2", "DeepSeek 3.2"),
+        ("minimax-m2.5", "MiniMax M2.5"),
+        ("minimax-m2.1", "MiniMax M2.1"),
+        ("glm-5", "GLM 5"),
+        ("qwen3-coder-next", "Qwen3 Coder Next"),
+        ("kimi-k3", "Kimi K3"),
+    ] {
+        models.push(Model {
+            id: id.into(),
+            object: "model".into(),
+            created: 0,
+            owned_by: "kiro".into(),
+            display_name: name.into(),
+            model_type: "chat".into(),
+            // 上游未公布的输出限额不猜测，发现目录后再补充。
+            max_tokens: None,
+        });
     }
     models
 }
@@ -319,7 +341,8 @@ fn merge_discovered_models(
                 .id
                 .strip_suffix("-thinking")
                 .unwrap_or(&existing.id);
-            canonical_model_id(base_id).eq_ignore_ascii_case(&id)
+            existing.id.eq_ignore_ascii_case(&id)
+                || canonical_model_id(base_id).eq_ignore_ascii_case(&id)
                 || map_model(&existing.id)
                     .is_some_and(|mapped| canonical_model_id(&mapped).eq_ignore_ascii_case(&id))
         };
@@ -341,6 +364,15 @@ fn merge_discovered_models(
             if matches_model(existing) {
                 if let Some(limit) = output_limit {
                     existing.max_tokens = Some(limit);
+                }
+            }
+            if existing.id.eq_ignore_ascii_case(&id) {
+                if let Some(name) = model
+                    .model_name
+                    .as_ref()
+                    .filter(|name| !name.trim().is_empty())
+                {
+                    existing.display_name = name.clone();
                 }
             }
         }
@@ -856,7 +888,7 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
-/// Sonnet 5 / Opus 5（含裸别名）默认拆分上游的 thinking 标签，除非显式禁用。
+/// Sonnet / Opus 5、5.5（含裸别名）默认拆分上游的 thinking 标签，除非显式禁用。
 /// GPT-5.6 使用隐藏推理，其他模型仅在客户端显式开启时拆分。
 pub(crate) fn should_extract_thinking(model: &str, thinking: &Option<Thinking>) -> bool {
     let model_lower = model.to_lowercase();
@@ -868,7 +900,7 @@ pub(crate) fn should_extract_thinking(model: &str, thinking: &Option<Thinking>) 
         map_model(model)
             .map(|model| canonical_model_id(&model))
             .as_deref(),
-        Some("claude-sonnet-5") | Some("claude-opus-5")
+        Some("claude-sonnet-5" | "claude-opus-5" | "claude-sonnet-5.5" | "claude-opus-5.5")
     ) {
         thinking
             .as_ref()
@@ -881,7 +913,7 @@ pub(crate) fn should_extract_thinking(model: &str, thinking: &Option<Thinking>) 
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6 / Opus 5 / Sonnet 5 / Fable 5.1：覆写为 adaptive 类型
+/// - Opus 4.6 / Opus、Sonnet 5、5.5 / Fable 5.1：覆写为 adaptive 类型
 /// - GPT-5.6：保留隐藏推理，不注入 Claude thinking 配置
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
@@ -902,6 +934,8 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         Some("claude-opus-4.6")
             | Some("claude-opus-5")
             | Some("claude-sonnet-5")
+            | Some("claude-opus-5.5")
+            | Some("claude-sonnet-5.5")
             | Some("claude-fable-5.1")
     );
 
@@ -932,6 +966,71 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_catalog_includes_new_models_without_invented_output_limits() {
+        let models = static_models();
+        for id in [
+            "auto",
+            "claude-opus-5.5",
+            "claude-opus-5.5-thinking",
+            "claude-sonnet-5.5",
+            "claude-sonnet-5.5-thinking",
+            "deepseek-3.2",
+            "minimax-m2.5",
+            "minimax-m2.1",
+            "glm-5",
+            "qwen3-coder-next",
+            "kimi-k3",
+        ] {
+            assert_eq!(
+                models.iter().filter(|model| model.id == id).count(),
+                1,
+                "{id}"
+            );
+            let model = models.iter().find(|model| model.id == id).unwrap();
+            assert!(
+                serde_json::to_value(model)
+                    .unwrap()
+                    .get("max_tokens")
+                    .is_none()
+            );
+        }
+        for model in models {
+            assert!(map_model(&model.id).is_some(), "{}", model.id);
+        }
+    }
+
+    #[test]
+    fn discovered_fallback_metadata_keeps_claude_versions_separate() {
+        let mut models = static_models();
+        let discovered = serde_json::from_value(json!([
+            {"modelId":"claude-opus-5", "tokenLimits":{"maxOutputTokens":64000}},
+            {"modelId":"claude-opus-5.5", "tokenLimits":{"maxOutputTokens":96000}},
+            {"modelId":"kimi-k3", "modelName":"Upstream Kimi", "tokenLimits":{"maxOutputTokens":8192}}
+        ])).unwrap();
+        merge_discovered_models(&mut models, discovered);
+        for (base, limit) in [("claude-opus-5", 64000), ("claude-opus-5.5", 96000)] {
+            for suffix in ["", "-thinking"] {
+                let id = format!("{base}{suffix}");
+                assert_eq!(
+                    models
+                        .iter()
+                        .find(|model| model.id == id)
+                        .unwrap()
+                        .max_tokens,
+                    Some(limit)
+                );
+            }
+        }
+        let kimi = models.iter().find(|model| model.id == "kimi-k3").unwrap();
+        assert_eq!(kimi.max_tokens, Some(8192));
+        assert_eq!(kimi.display_name, "Upstream Kimi");
+        assert_eq!(
+            models.iter().filter(|model| model.id == "kimi-k3").count(),
+            1
+        );
+    }
 
     #[tokio::test]
     async fn image_dimension_errors_preserve_the_kiro_reason_as_http_400() {
@@ -1196,6 +1295,8 @@ mod tests {
             "SONNET",
             "claude-sonnet-5",
             "claude-opus-5-thinking",
+            "claude-opus-5.5",
+            "claude-sonnet-5.5-thinking",
         ] {
             assert!(should_extract_thinking(model, &None), "{model}");
             assert!(
@@ -1252,6 +1353,8 @@ mod tests {
             ("claude-opus-4-6-thinking", "adaptive"),
             ("claude-opus-5-thinking", "adaptive"),
             ("claude-sonnet-5-thinking", "adaptive"),
+            ("claude-opus-5.5-thinking", "adaptive"),
+            ("claude-sonnet-5-5-thinking", "adaptive"),
             ("claude-fable-5-1-thinking", "adaptive"),
             ("claude-fable-5.1-thinking", "adaptive"),
             ("claude-sonnet-4-5-thinking", "enabled"),

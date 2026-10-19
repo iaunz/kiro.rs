@@ -93,7 +93,7 @@ Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 裸别名 opus/sonnet/haiku 指向当前支持的最新版本；旧别名保持兼容映射。
+/// 裸别名 opus/sonnet 指向 5，haiku 指向 4.5；旧别名保持兼容映射。
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.trim().to_lowercase();
     let upstream_id = model_lower
@@ -101,6 +101,13 @@ pub fn map_model(model: &str) -> Option<String> {
         .unwrap_or(&model_lower);
     if let Some(discovered) = crate::kiro::model_catalog::discovered_model_id(upstream_id) {
         return Some(discovered);
+    }
+
+    // 已知上游 ID 在目录尚未加载或查询失败时也可使用；未知模型仍须动态发现。
+    match upstream_id {
+        "auto" | "deepseek-3.2" | "minimax-m2.5" | "minimax-m2.1" | "glm-5"
+        | "qwen3-coder-next" | "kimi-k3" => return Some(upstream_id.to_string()),
+        _ => {}
     }
 
     match model_lower.as_str() {
@@ -114,7 +121,9 @@ pub fn map_model(model: &str) -> Option<String> {
         // Kiro 使用点号版本 ID，而客户端也可能使用连字符形式。
         Some("claude-fable-5.1".to_string())
     } else if model_lower.contains("sonnet") {
-        if model_lower.contains("sonnet-5") {
+        if model_lower.contains("sonnet-5.5") || model_lower.contains("sonnet-5-5") {
+            Some("claude-sonnet-5.5".to_string())
+        } else if model_lower.contains("sonnet-5") {
             Some("claude-sonnet-5".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
@@ -124,7 +133,9 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.5".to_string())
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("opus-5") {
+        if model_lower.contains("opus-5.5") || model_lower.contains("opus-5-5") {
+            Some("claude-opus-5.5".to_string())
+        } else if model_lower.contains("opus-5") {
             Some("claude-opus-5".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
@@ -1012,6 +1023,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn listed_models_convert_without_catalog_discovery() {
+        for model in [
+            "auto",
+            "claude-opus-5.5",
+            "claude-opus-5.5-thinking",
+            "claude-sonnet-5.5",
+            "claude-sonnet-5.5-thinking",
+            "claude-opus-5",
+            "claude-opus-5-thinking",
+            "claude-sonnet-5",
+            "claude-sonnet-5-thinking",
+            "claude-opus-4.8",
+            "claude-opus-4.8-thinking",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "claude-opus-4.7",
+            "claude-opus-4.7-thinking",
+            "claude-opus-4.6",
+            "claude-opus-4.6-thinking",
+            "claude-sonnet-4.6",
+            "claude-sonnet-4.6-thinking",
+            "claude-opus-4.5",
+            "claude-opus-4.5-thinking",
+            "claude-sonnet-4.5",
+            "claude-sonnet-4.5-thinking",
+            "claude-haiku-4.5",
+            "claude-haiku-4.5-thinking",
+            "deepseek-3.2",
+            "minimax-m2.5",
+            "minimax-m2.1",
+            "glm-5",
+            "qwen3-coder-next",
+            "kimi-k3",
+        ] {
+            let expected = model.strip_suffix("-thinking").unwrap_or(model);
+            for requested in [model.to_string(), format!(" {} ", model.to_uppercase())] {
+                assert_eq!(
+                    map_model(&requested).as_deref(),
+                    Some(expected),
+                    "{requested}"
+                );
+                let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+                    "model": requested,
+                    "max_tokens": 1024,
+                    "messages": [
+                        {"role": "user", "content": "Hello"},
+                        {"role": "assistant", "content": "Hi"},
+                        {"role": "user", "content": "Continue"}
+                    ]
+                }))
+                .unwrap();
+                let state = convert_request(&req).unwrap().conversation_state;
+                assert_eq!(state.current_message.user_input_message.model_id, expected);
+                for message in state.history {
+                    if let Message::User(user) = message {
+                        assert_eq!(user.user_input_message.model_id, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_map_model_family_aliases_and_new_models() {
         for (name, expected, context_window) in [
             ("opus", "claude-opus-5", 1_000_000),
@@ -1021,6 +1096,10 @@ mod tests {
             ("haiku", "claude-haiku-4.5", 200_000),
             (" HAIKU ", "claude-haiku-4.5", 200_000),
             ("claude-sonnet-5-thinking", "claude-sonnet-5", 1_000_000),
+            ("claude-opus-5-5-thinking", "claude-opus-5.5", 200_000),
+            ("opus-5.5", "claude-opus-5.5", 200_000),
+            ("claude-sonnet-5-5", "claude-sonnet-5.5", 200_000),
+            ("sonnet-5.5-thinking", "claude-sonnet-5.5", 200_000),
             ("claude-fable-5-1", "claude-fable-5.1", 1_000_000),
             ("claude-fable-5.1-thinking", "claude-fable-5.1", 1_000_000),
             ("claude-sonnet-4", "claude-sonnet-4.5", 200_000),
@@ -1190,7 +1269,15 @@ mod tests {
 
     #[test]
     fn test_map_model_unsupported() {
-        assert!(map_model("gpt-4").is_none());
+        for model in [
+            "gpt-4",
+            "kimi-k4",
+            "deepseek-unknown",
+            "minimax-m999",
+            "unknown-model",
+        ] {
+            assert!(map_model(model).is_none(), "{model}");
+        }
     }
 
     #[test]
