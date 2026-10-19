@@ -174,8 +174,9 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 根据模型名称返回对应的上下文窗口大小
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 / Fable 5.1 同 1M。
+/// 静态值依据 Kiro 官方模型对照表（2026-10-19 核对）：
+/// https://kiro.dev/docs/models/#quick-comparison
+/// GPT-5.6 的 272K 是计费分界，最大上下文为 1M；有效动态限额优先。
 pub fn get_context_window_size(model: &str) -> i32 {
     let model_lower = model.trim().to_lowercase();
     let upstream_id = model_lower
@@ -192,19 +193,19 @@ pub fn get_context_window_size(model: &str) -> i32 {
         return size;
     }
 
-    match mapped.map(|model| crate::kiro::model_catalog::canonical_model_id(&model)) {
-        Some(mapped)
-            if mapped == "claude-sonnet-5"
-                || mapped == "claude-fable-5.1"
-                || mapped == "claude-sonnet-4.6"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8"
-                || mapped == "claude-opus-5" =>
-        {
-            1_000_000
-        }
-        Some(mapped) if mapped.starts_with("gpt-") => 272_000,
+    match mapped
+        .map(|model| crate::kiro::model_catalog::canonical_model_id(&model))
+        .as_deref()
+    {
+        Some(
+            "claude-sonnet-5.5" | "claude-sonnet-5" | "claude-fable-5.1" | "claude-sonnet-4.6"
+            | "claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8" | "claude-opus-5"
+            | "claude-opus-5.5" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "kimi-k3",
+        ) => 1_000_000,
+        Some("deepseek-3.2") => 128_000,
+        Some("qwen3-coder-next") => 256_000,
+        // Claude 4.5、MiniMax M2.1/M2.5、GLM-5 为 200K。
+        // Auto 未公布固定窗口，其他未知模型也暂用通用兜底。
         _ => 200_000,
     }
 }
@@ -1023,46 +1024,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn listed_models_convert_without_catalog_discovery() {
-        for model in [
-            "auto",
-            "claude-opus-5.5",
-            "claude-opus-5.5-thinking",
-            "claude-sonnet-5.5",
-            "claude-sonnet-5.5-thinking",
-            "claude-opus-5",
-            "claude-opus-5-thinking",
-            "claude-sonnet-5",
-            "claude-sonnet-5-thinking",
-            "claude-opus-4.8",
-            "claude-opus-4.8-thinking",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "claude-opus-4.7",
-            "claude-opus-4.7-thinking",
-            "claude-opus-4.6",
-            "claude-opus-4.6-thinking",
-            "claude-sonnet-4.6",
-            "claude-sonnet-4.6-thinking",
-            "claude-opus-4.5",
-            "claude-opus-4.5-thinking",
-            "claude-sonnet-4.5",
-            "claude-sonnet-4.5-thinking",
-            "claude-haiku-4.5",
-            "claude-haiku-4.5-thinking",
-            "deepseek-3.2",
-            "minimax-m2.5",
-            "minimax-m2.1",
-            "glm-5",
-            "qwen3-coder-next",
-            "kimi-k3",
+    fn listed_models_match_kiro_catalog_without_discovery() {
+        for (model, context_window) in [
+            ("auto", 200_000), // 未公布固定窗口，验证通用兜底。
+            ("claude-opus-5.5", 1_000_000),
+            ("claude-opus-5.5-thinking", 1_000_000),
+            ("claude-sonnet-5.5", 1_000_000),
+            ("claude-sonnet-5.5-thinking", 1_000_000),
+            ("claude-opus-5", 1_000_000),
+            ("claude-opus-5-thinking", 1_000_000),
+            ("claude-sonnet-5", 1_000_000),
+            ("claude-sonnet-5-thinking", 1_000_000),
+            ("claude-opus-4.8", 1_000_000),
+            ("claude-opus-4.8-thinking", 1_000_000),
+            ("gpt-5.6-sol", 1_000_000),
+            ("gpt-5.6-terra", 1_000_000),
+            ("gpt-5.6-luna", 1_000_000),
+            ("claude-opus-4.7", 1_000_000),
+            ("claude-opus-4.7-thinking", 1_000_000),
+            ("claude-opus-4.6", 1_000_000),
+            ("claude-opus-4.6-thinking", 1_000_000),
+            ("claude-sonnet-4.6", 1_000_000),
+            ("claude-sonnet-4.6-thinking", 1_000_000),
+            ("claude-opus-4.5", 200_000),
+            ("claude-opus-4.5-thinking", 200_000),
+            ("claude-sonnet-4.5", 200_000),
+            ("claude-sonnet-4.5-thinking", 200_000),
+            ("claude-haiku-4.5", 200_000),
+            ("claude-haiku-4.5-thinking", 200_000),
+            ("deepseek-3.2", 128_000),
+            ("minimax-m2.5", 200_000),
+            ("minimax-m2.1", 200_000),
+            ("glm-5", 200_000),
+            ("qwen3-coder-next", 256_000),
+            ("kimi-k3", 1_000_000),
         ] {
             let expected = model.strip_suffix("-thinking").unwrap_or(model);
             for requested in [model.to_string(), format!(" {} ", model.to_uppercase())] {
                 assert_eq!(
                     map_model(&requested).as_deref(),
                     Some(expected),
+                    "{requested}"
+                );
+                assert_eq!(
+                    get_context_window_size(&requested),
+                    context_window,
                     "{requested}"
                 );
                 let req: MessagesRequest = serde_json::from_value(serde_json::json!({
@@ -1096,10 +1102,10 @@ mod tests {
             ("haiku", "claude-haiku-4.5", 200_000),
             (" HAIKU ", "claude-haiku-4.5", 200_000),
             ("claude-sonnet-5-thinking", "claude-sonnet-5", 1_000_000),
-            ("claude-opus-5-5-thinking", "claude-opus-5.5", 200_000),
-            ("opus-5.5", "claude-opus-5.5", 200_000),
-            ("claude-sonnet-5-5", "claude-sonnet-5.5", 200_000),
-            ("sonnet-5.5-thinking", "claude-sonnet-5.5", 200_000),
+            ("claude-opus-5-5-thinking", "claude-opus-5.5", 1_000_000),
+            ("opus-5.5", "claude-opus-5.5", 1_000_000),
+            ("claude-sonnet-5-5", "claude-sonnet-5.5", 1_000_000),
+            ("sonnet-5.5-thinking", "claude-sonnet-5.5", 1_000_000),
             ("claude-fable-5-1", "claude-fable-5.1", 1_000_000),
             ("claude-fable-5.1-thinking", "claude-fable-5.1", 1_000_000),
             ("claude-sonnet-4", "claude-sonnet-4.5", 200_000),
@@ -1137,7 +1143,7 @@ mod tests {
                 );
                 assert!(!wire.contains("<max_thinking_length>"));
                 assert!(!wire.contains("<thinking_effort>"));
-                assert_eq!(get_context_window_size(model), 272_000);
+                assert_eq!(get_context_window_size(model), 1_000_000);
             }
         }
     }
@@ -1352,10 +1358,10 @@ mod tests {
         // 未知 GPT 变体不支持
         assert!(map_model("gpt-5.6-nova").is_none());
         assert!(map_model("gpt-4").is_none());
-        // GPT 系列 272K 上下文窗口
-        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
-        assert_eq!(get_context_window_size("gpt-5.6-terra"), 272_000);
-        assert_eq!(get_context_window_size("gpt-5.6-luna"), 272_000);
+        // GPT-5.6 的最大上下文为 1M；272K 只是计费分界。
+        assert_eq!(get_context_window_size("gpt-5.6-sol"), 1_000_000);
+        assert_eq!(get_context_window_size("gpt-5.6-terra"), 1_000_000);
+        assert_eq!(get_context_window_size("gpt-5.6-luna"), 1_000_000);
     }
 
     #[test]
