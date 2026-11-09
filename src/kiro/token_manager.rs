@@ -561,6 +561,16 @@ struct CredentialEntry {
     last_used_at: Option<String>,
 }
 
+impl CredentialEntry {
+    /// 刷新只更新令牌字段，保留请求期间修改的备注、优先级等管理信息。
+    fn apply_refreshed_credentials(&mut self, credentials: &KiroCredentials) {
+        self.credentials.access_token = credentials.access_token.clone();
+        self.credentials.refresh_token = credentials.refresh_token.clone();
+        self.credentials.expires_at = credentials.expires_at.clone();
+        self.credentials.profile_arn = credentials.profile_arn.clone();
+    }
+}
+
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisabledReason {
@@ -615,6 +625,8 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 管理员备注
+    pub remark: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -1075,7 +1087,7 @@ impl MultiTokenManager {
                 {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
+                        entry.apply_refreshed_credentials(&new_creds);
                     }
                 }
 
@@ -1124,12 +1136,19 @@ impl MultiTokenManager {
     /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
-        use anyhow::Context;
-
         // 仅多凭据格式才回写
         if !self.is_multiple_format {
             return Ok(false);
         }
+
+        // 持锁直到写入完成，避免并发持久化覆盖刚保存的备注。
+        let entries = self.entries.lock();
+        self.persist_credentials_locked(&entries)
+    }
+
+    /// 保存已有锁保护的凭据；备注编辑也支持单对象格式。
+    fn persist_credentials_locked(&self, entries: &[CredentialEntry]) -> anyhow::Result<bool> {
+        use anyhow::Context;
 
         let path = match &self.credentials_path {
             Some(p) => p,
@@ -1137,22 +1156,24 @@ impl MultiTokenManager {
         };
 
         // 收集所有凭据
-        let credentials: Vec<KiroCredentials> = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .map(|e| {
-                    let mut cred = e.credentials.clone();
-                    cred.canonicalize_auth_method();
-                    // 同步 disabled 状态到凭据对象
-                    cred.disabled = e.disabled;
-                    cred
-                })
-                .collect()
-        };
+        let credentials: Vec<KiroCredentials> = entries
+            .iter()
+            .map(|e| {
+                let mut cred = e.credentials.clone();
+                cred.canonicalize_auth_method();
+                // 同步 disabled 状态到凭据对象
+                cred.disabled = e.disabled;
+                cred
+            })
+            .collect();
 
         // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
+        let json = if !self.is_multiple_format && credentials.len() == 1 {
+            serde_json::to_string_pretty(&credentials[0])
+        } else {
+            serde_json::to_string_pretty(&credentials)
+        }
+        .context("序列化凭据失败")?;
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -1585,6 +1606,7 @@ impl MultiTokenManager {
                         None
                     },
                     email: e.credentials.email.clone(),
+                    remark: e.credentials.remark.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
@@ -1605,6 +1627,39 @@ impl MultiTokenManager {
             total: entries.len(),
             available,
         }
+    }
+
+    /// 获取完整凭据（Admin API），同步运行时的 ID 和禁用状态。
+    pub fn get_credential(&self, id: u64) -> anyhow::Result<KiroCredentials> {
+        let entries = self.entries.lock();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+        let mut credential = entry.credentials.clone();
+        credential.id = Some(entry.id);
+        credential.disabled = entry.disabled;
+        credential.canonicalize_auth_method();
+        Ok(credential)
+    }
+
+    /// 设置备注并保存；写入失败时恢复原备注。
+    pub fn set_remark(&self, id: u64, remark: String) -> anyhow::Result<()> {
+        let mut entries = self.entries.lock();
+        let index = entries
+            .iter()
+            .position(|entry| entry.id == id)
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+        let remark = remark.trim().to_string();
+        let previous = std::mem::replace(
+            &mut entries[index].credentials.remark,
+            (!remark.is_empty()).then_some(remark),
+        );
+        if let Err(error) = self.persist_credentials_locked(&entries) {
+            entries[index].credentials.remark = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// 设置凭据禁用状态（Admin API）
@@ -1778,7 +1833,7 @@ impl MultiTokenManager {
                     {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
+                            entry.apply_refreshed_credentials(&new_creds);
                         }
                     }
                     // 持久化失败只记录警告，不影响本次请求
@@ -2114,7 +2169,7 @@ impl MultiTokenManager {
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.credentials = new_creds;
+                entry.apply_refreshed_credentials(&new_creds);
                 entry.refresh_failure_count = 0;
             }
         }
@@ -2191,6 +2246,140 @@ mod tests {
     use super::*;
     use crate::kiro::model::credentials::{BUILDER_ID_PROFILE_ARN, SOCIAL_PROFILE_ARN};
 
+    #[test]
+    fn credential_remarks_persist_in_single_and_multiple_formats() {
+        use crate::kiro::model::credentials::CredentialsConfig;
+
+        for multiple in [false, true] {
+            let directory =
+                std::env::temp_dir().join(format!("kiro-remarks-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("credentials.json");
+            let mut credentials = vec![KiroCredentials {
+                id: Some(7),
+                refresh_token: Some("test-refresh-token".to_string()),
+                remark: Some("初始备注".to_string()),
+                machine_id: Some("a".repeat(64)),
+                ..Default::default()
+            }];
+            if multiple {
+                credentials.push(KiroCredentials {
+                    id: Some(8),
+                    remark: Some("其他账号".to_string()),
+                    ..Default::default()
+                });
+            }
+            let original = if multiple {
+                serde_json::to_value(&credentials).unwrap()
+            } else {
+                serde_json::to_value(&credentials[0]).unwrap()
+            };
+            std::fs::write(&path, serde_json::to_string(&original).unwrap()).unwrap();
+            let manager = MultiTokenManager::new(
+                Config::default(),
+                credentials,
+                None,
+                Some(path.clone()),
+                multiple,
+            )
+            .unwrap();
+            manager
+                .set_remark(7, "  项目账号\n多行备注  ".to_string())
+                .unwrap();
+            let config = CredentialsConfig::load(&path).unwrap();
+            assert_eq!(matches!(&config, CredentialsConfig::Multiple(_)), multiple);
+            let reloaded = MultiTokenManager::new(
+                Config::default(),
+                config.into_sorted_credentials(),
+                None,
+                Some(path.clone()),
+                multiple,
+            )
+            .unwrap();
+            assert_eq!(
+                reloaded.get_credential(7).unwrap().remark.as_deref(),
+                Some("项目账号\n多行备注")
+            );
+            assert_eq!(
+                reloaded.get_credential(7).unwrap().refresh_token.as_deref(),
+                Some("test-refresh-token")
+            );
+            if multiple {
+                assert_eq!(
+                    reloaded.get_credential(8).unwrap().remark.as_deref(),
+                    Some("其他账号")
+                );
+            }
+            assert!(reloaded.set_remark(99, "不存在".to_string()).is_err());
+            reloaded.set_remark(7, " \n ".to_string()).unwrap();
+            let cleared = CredentialsConfig::load(&path)
+                .unwrap()
+                .into_sorted_credentials();
+            assert!(
+                cleared
+                    .iter()
+                    .find(|credential| credential.id == Some(7))
+                    .unwrap()
+                    .remark
+                    .is_none()
+            );
+            drop(reloaded);
+            drop(manager);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_remark_write_keeps_previous_value() {
+        let missing_path = std::env::temp_dir()
+            .join(format!("kiro-missing-{}", uuid::Uuid::new_v4()))
+            .join("credentials.json");
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials {
+                id: Some(7),
+                machine_id: Some("a".repeat(64)),
+                remark: Some("原备注".to_string()),
+                ..Default::default()
+            }],
+            None,
+            Some(missing_path),
+            true,
+        )
+        .unwrap();
+        assert!(manager.set_remark(7, "新备注".to_string()).is_err());
+        assert_eq!(
+            manager.get_credential(7).unwrap().remark.as_deref(),
+            Some("原备注")
+        );
+    }
+
+    #[test]
+    fn token_refresh_preserves_remark_edited_during_request() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials {
+                id: Some(7),
+                remark: Some("刷新前".to_string()),
+                ..Default::default()
+            }],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut refreshed = manager.get_credential(7).unwrap();
+        refreshed.access_token = Some("new-access-token".to_string());
+        refreshed.refresh_token = Some("rotated-refresh-token".to_string());
+        manager
+            .set_remark(7, "刷新请求期间编辑".to_string())
+            .unwrap();
+        manager.entries.lock()[0].apply_refreshed_credentials(&refreshed);
+        let credential = manager.get_credential(7).unwrap();
+        assert_eq!(credential.remark.as_deref(), Some("刷新请求期间编辑"));
+        assert_eq!(credential.access_token, refreshed.access_token);
+        assert_eq!(credential.refresh_token, refreshed.refresh_token);
+    }
     #[tokio::test]
     async fn manual_model_context_is_bound_to_requested_disabled_credential() {
         let active = KiroCredentials {

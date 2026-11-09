@@ -146,6 +146,7 @@ impl AdminService {
                 api_key_hash: entry.api_key_hash,
                 masked_api_key: entry.masked_api_key,
                 email: entry.email,
+                remark: entry.remark,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
@@ -165,6 +166,20 @@ impl AdminService {
             current_id: snapshot.current_id,
             credentials,
         }
+    }
+
+    /// 按需获取完整凭据，仅供管理员导出使用。
+    pub fn get_credential(&self, id: u64) -> Result<KiroCredentials, AdminServiceError> {
+        self.token_manager
+            .get_credential(id)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据备注
+    pub fn set_remark(&self, id: u64, remark: String) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_remark(id, remark)
+            .map_err(|e| self.classify_error(e, id))
     }
 
     /// 设置凭据禁用状态
@@ -310,6 +325,10 @@ impl AdminService {
             api_region: req.api_region,
             machine_id: req.machine_id,
             email: req.email,
+            remark: req.remark.and_then(|remark| {
+                let remark = remark.trim().to_string();
+                (!remark.is_empty()).then_some(remark)
+            }),
             subscription_title: None, // 将在首次获取使用额度时自动更新
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,

@@ -2,6 +2,7 @@ import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
   CredentialsStatusResponse,
+  CredentialDetails,
   BalanceResponse,
   CredentialModelsResponse,
   SuccessResponse,
@@ -33,6 +34,20 @@ api.interceptors.request.use((config) => {
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
   const { data } = await api.get<CredentialsStatusResponse>('/credentials')
+  return data
+}
+
+// 按需获取完整凭据，不放入列表或查询缓存
+export async function getCredential(id: number): Promise<CredentialDetails> {
+  const { data } = await api.get<CredentialDetails>(`/credentials/${id}`)
+  if (data.id !== id) {
+    throw new Error('返回的凭据与当前凭据不匹配，请重试')
+  }
+  return data
+}
+
+export async function setCredentialRemark(id: number, remark: string): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/remark`, { remark })
   return data
 }
 

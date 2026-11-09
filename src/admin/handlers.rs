@@ -3,6 +3,7 @@
 use axum::{
     Json,
     extract::{Path, State},
+    http::header,
     response::IntoResponse,
 };
 
@@ -11,7 +12,7 @@ use super::{
     sso::StartSsoSessionRequest,
     types::{
         AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        SetRemarkRequest, SuccessResponse,
     },
 };
 
@@ -20,6 +21,32 @@ use super::{
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_all_credentials();
     Json(response)
+}
+
+/// GET /api/admin/credentials/:id
+/// 获取完整凭据 JSON，不允许缓存包含密钥的响应。
+pub async fn get_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let response = match state.service.get_credential(id) {
+        Ok(credential) => Json(credential).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    };
+    ([(header::CACHE_CONTROL, "no-store")], response)
+}
+
+/// POST /api/admin/credentials/:id/remark
+/// 设置或清除凭据备注
+pub async fn set_credential_remark(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetRemarkRequest>,
+) -> impl IntoResponse {
+    match state.service.set_remark(id, payload.remark) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 备注已保存", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// POST /api/admin/credentials/:id/disabled

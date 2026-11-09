@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, List } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, List, Copy, Pencil } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -8,6 +8,10 @@ import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
 import { CredentialModelsDialog } from '@/components/credential-models-dialog'
+import { CredentialRemarkDialog } from '@/components/credential-remark-dialog'
+import { getCredential } from '@/api/credentials'
+import { copyToClipboard } from '@/lib/clipboard'
+import { extractErrorMessage } from '@/lib/utils'
 import {
   Dialog,
   DialogContent,
@@ -62,12 +66,33 @@ export function CredentialCard({
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [showModelsDialog, setShowModelsDialog] = useState(false)
+  const [showRemarkDialog, setShowRemarkDialog] = useState(false)
+  const [copyingJson, setCopyingJson] = useState(false)
+  const [manualCopyJson, setManualCopyJson] = useState<string | null>(null)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+
+  const handleCopyJson = async () => {
+    setCopyingJson(true)
+    try {
+      const details = await getCredential(credential.id)
+      const json = JSON.stringify(details, null, 2)
+      try {
+        await copyToClipboard(json)
+        toast.success('已复制完整凭据 JSON')
+      } catch {
+        setManualCopyJson(json)
+      }
+    } catch (error) {
+      toast.error(`获取凭据失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setCopyingJson(false)
+    }
+  }
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -296,8 +321,29 @@ export function CredentialCard({
             )}
           </div>
 
+          {credential.remark && (
+            <div className="rounded-md bg-muted/50 p-3 text-sm">
+              <span className="text-muted-foreground">备注：</span>
+              <span className="whitespace-pre-wrap break-words">{credential.remark}</span>
+            </div>
+          )}
+
           {/* 操作按钮 */}
           <div className="flex flex-wrap gap-2 pt-2 border-t">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleCopyJson}
+              disabled={copyingJson}
+              title="复制此凭据的完整 JSON"
+            >
+              {copyingJson ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Copy className="h-4 w-4 mr-1" />}
+              {copyingJson ? '复制中...' : '复制 JSON'}
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setShowRemarkDialog(true)}>
+              <Pencil className="h-4 w-4 mr-1" />
+              {credential.remark ? '编辑备注' : '添加备注'}
+            </Button>
             <Button
               size="sm"
               variant="outline"
@@ -390,6 +436,35 @@ export function CredentialCard({
           onOpenChange={setShowModelsDialog}
         />
       )}
+
+      {showRemarkDialog && (
+        <CredentialRemarkDialog
+          key={credential.id}
+          credential={credential}
+          onOpenChange={setShowRemarkDialog}
+        />
+      )}
+
+      <Dialog open={manualCopyJson !== null} onOpenChange={(open) => {
+        if (!open) setManualCopyJson(null)
+      }}>
+        <DialogContent className="w-[calc(100%-2rem)] sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>复制凭据 #{credential.id} JSON</DialogTitle>
+            <DialogDescription>浏览器未允许自动复制，请选中下方内容手动复制。</DialogDescription>
+          </DialogHeader>
+          <textarea
+            aria-label="完整凭据 JSON"
+            className="h-80 w-full rounded-md border border-input bg-background p-3 font-mono text-xs"
+            readOnly
+            value={manualCopyJson ?? ''}
+            onFocus={(event) => event.currentTarget.select()}
+          />
+          <DialogFooter>
+            <Button onClick={() => setManualCopyJson(null)}>关闭</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* 删除确认对话框 */}
       <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>

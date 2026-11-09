@@ -17,6 +17,7 @@ export interface CredentialStatusItem {
   authMethod: string | null
   hasProfileArn: boolean
   email?: string
+  remark?: string | null
   refreshTokenHash?: string
   apiKeyHash?: string
   maskedApiKey?: string
@@ -82,11 +83,25 @@ export interface AddCredentialRequest {
   authRegion?: string
   apiRegion?: string
   machineId?: string
+  remark?: string
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
   kiroApiKey?: string
   endpoint?: string
+}
+
+// 完整凭据，仅在管理员点击复制时读取
+export interface CredentialDetails extends Omit<AddCredentialRequest, 'authMethod'> {
+  id: number
+  accessToken?: string
+  profileArn?: string
+  expiresAt?: string
+  authMethod?: string
+  region?: string
+  email?: string
+  subscriptionTitle?: string
+  disabled: boolean
 }
 
 // 添加凭据响应

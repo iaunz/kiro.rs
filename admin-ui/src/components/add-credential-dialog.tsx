@@ -33,6 +33,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
   const [endpoint, setEndpoint] = useState('')
+  const [remark, setRemark] = useState('')
 
   const { mutate, isPending } = useAddCredential()
 
@@ -50,6 +51,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setProxyUsername('')
     setProxyPassword('')
     setEndpoint('')
+    setRemark('')
   }
 
   const isApiKey = authMethod === 'api_key'
@@ -90,6 +92,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         proxyUsername: proxyUsername.trim() || undefined,
         proxyPassword: proxyPassword.trim() || undefined,
         endpoint: endpoint.trim() || undefined,
+        remark: remark.trim() || undefined,
       },
       {
         onSuccess: (data) => {
@@ -223,6 +226,19 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 </div>
               </>
             )}
+
+            <div className="space-y-2">
+              <label htmlFor="new-credential-remark" className="text-sm font-medium">备注</label>
+              <textarea
+                id="new-credential-remark"
+                className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-50"
+                rows={3}
+                placeholder="可选，例如账号用途或所属项目"
+                value={remark}
+                onChange={(event) => setRemark(event.target.value)}
+                disabled={isPending}
+              />
+            </div>
 
             {/* 优先级 */}
             <div className="space-y-2">

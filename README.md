@@ -248,6 +248,7 @@ docker-compose up
 | `apiRegion`    | string | 凭据级 API Region，用于 API 请求                    |
 | `machineId`    | string | 凭据级机器码（64位十六进制）                             |
 | `email`        | string | 用户邮箱（可选，从 API 获取）                           |
+| `remark`       | string | 管理员备注（可选，可在管理界面新增、编辑或清除）               |
 | `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
 | `proxyUsername`| string | 凭据级代理用户名（可选）                                |
 | `proxyPassword`| string | 凭据级代理密码（可选）                                 |
@@ -568,6 +569,8 @@ GPT-5.6 也接受 `gpt-5-6-*` 和 `openai.gpt-5.6-*` 写法。Claude 历史模�
 - **Admin API（认证同 API Key）**
   - `GET /api/admin/credentials` - 获取所有凭据状态
   - `POST /api/admin/credentials` - 添加新凭据
+  - `GET /api/admin/credentials/:id` - 获取单个凭据的完整 JSON（含密钥，响应禁止缓存）
+  - `POST /api/admin/credentials/:id/remark` - 设置备注，传入 `{"remark":"备注内容"}`；空字符串清除备注
   - `DELETE /api/admin/credentials/:id` - 删除凭据
   - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
@@ -577,6 +580,7 @@ GPT-5.6 也接受 `gpt-5-6-*` 和 `openai.gpt-5.6-*` 写法。Claude 历史模�
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
+  - 凭据卡片支持复制完整 JSON，以及新增、编辑和清除备注；备注保存到凭据文件，兼容单对象和数组格式。
 
 每个凭据卡片的“获取模型”会单独查询该账号，展示上游实际返回的模型 ID，以及 Fable、Sonnet、Opus、Haiku 对应的 `-thinking` ID。这里保留上游 ID 的原始拼写，不混入 `/v1/models` 的静态兼容项，也不使用其他账号或全局目录的缓存结果。查询失败时显示错误；已禁用的凭据也可查询，操作不会重新启用凭据。
 

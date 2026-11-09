@@ -46,6 +46,8 @@ pub struct CredentialStatusItem {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 管理员备注
+    pub remark: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -80,6 +82,12 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 修改凭据备注请求（空字符串表示清除备注）
+#[derive(Debug, Deserialize)]
+pub struct SetRemarkRequest {
+    pub remark: String,
 }
 
 /// 添加凭据请求
@@ -119,6 +127,9 @@ pub struct AddCredentialRequest {
 
     /// 用户邮箱（可选，用于前端显示）
     pub email: Option<String>,
+
+    /// 管理员备注（可选）
+    pub remark: Option<String>,
 
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
     pub proxy_url: Option<String>,
