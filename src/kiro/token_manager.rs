@@ -18,6 +18,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::kiro_version::{USAGE_API_AWS_SDK_VERSION, USAGE_API_KIRO_VERSION};
+use crate::kiro::endpoint::management_host;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::UpstreamModel;
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
@@ -363,7 +364,7 @@ fn is_no_profile_concept_response(status: u16, body: &str) -> bool {
 /// 只能通过本接口获取。
 ///
 /// 上游接口（AWS JSON 1.0，**与用量类的 REST GET 不同**）：
-/// `POST https://q.{region}.amazonaws.com/`，请求头
+/// `POST https://management.{region}.kiro.dev/`（未上线区域回退 `q.{region}.amazonaws.com`），请求头
 /// `x-amz-target: AmazonCodeWhispererService.ListAvailableProfiles`，
 /// `Content-Type: application/x-amz-json-1.0`，Body `{"maxResults":N}`。
 ///
@@ -386,7 +387,7 @@ pub(crate) async fn list_available_profiles(
     let mut last_error: Option<String> = None;
     let mut empty_seen = false;
     for region in candidates.iter() {
-        let host = format!("q.{}.amazonaws.com", region);
+        let host = management_host(region);
         let url = format!("https://{}/", host);
 
         let mut request = client
@@ -497,7 +498,7 @@ pub(crate) async fn get_usage_limits(
 
     // 优先级：凭据.api_region > config.api_region > config.region
     let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    let host = management_host(region);
     let url = usage_limits_url(&host, credentials);
     let (user_agent, amz_user_agent) = usage_api_user_agents(credentials, config);
 

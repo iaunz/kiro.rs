@@ -1,9 +1,10 @@
 //! Kiro IDE 端点
 //!
-//! 对应 Kiro IDE 客户端目前使用的 AWS CodeWhisperer 端点：
-//! - API: `https://q.{api_region}.amazonaws.com/generateAssistantResponse`
-//! - MCP: `https://q.{api_region}.amazonaws.com/mcp`
+//! 对应 Kiro IDE 1.4.x 客户端使用的端点（host 规则见 [`super::runtime_host`]）：
+//! - API: `https://runtime.{api_region}.kiro.dev/generateAssistantResponse`
+//! - MCP: `https://runtime.{api_region}.kiro.dev/mcp`
 //!
+//! 未上线 kiro.dev 域名的区域回退 `q.{api_region}.amazonaws.com`。
 //! 请求头使用 aws-sdk-js User-Agent 标识。请求体会在根对象上注入 `profileArn`。
 
 use reqwest::RequestBuilder;
@@ -13,6 +14,9 @@ use super::{KiroEndpoint, RequestContext};
 
 /// Kiro IDE 端点名称
 pub const IDE_ENDPOINT_NAME: &str = "ide";
+
+/// 推理链路 UA 中的 `@aws/codewhisperer-streaming-client` 版本（Kiro IDE 1.4.121 内置）
+pub const STREAMING_SDK_VERSION: &str = "1.0.44";
 
 /// Kiro IDE 端点
 pub struct IdeEndpoint;
@@ -27,23 +31,24 @@ impl IdeEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        super::runtime_host(self.api_region(ctx))
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
-            ctx.config.kiro_version, ctx.machine_id
+            "aws-sdk-js/{} KiroIDE-{}-{}",
+            STREAMING_SDK_VERSION, ctx.config.kiro_version, ctx.machine_id
         )
     }
 
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
+            "aws-sdk-js/{sdk} ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#{sdk} m/E KiroIDE-{}-{}",
             ctx.config.system_version,
             ctx.config.node_version,
             ctx.config.kiro_version,
-            ctx.machine_id
+            ctx.machine_id,
+            sdk = STREAMING_SDK_VERSION,
         )
     }
 }
@@ -60,14 +65,11 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            self.api_region(ctx)
-        )
+        format!("https://{}/generateAssistantResponse", self.host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
+        format!("https://{}/mcp", self.host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {

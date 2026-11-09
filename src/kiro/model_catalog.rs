@@ -10,6 +10,7 @@ use reqwest::{Client, RequestBuilder, StatusCode};
 use tokio::sync::Mutex;
 
 use crate::kiro::kiro_version::{USAGE_API_AWS_SDK_VERSION, USAGE_API_KIRO_VERSION};
+use crate::kiro::endpoint::management_host;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{ListAvailableModelsResponse, UpstreamModel};
 use crate::kiro::model::credentials::KiroCredentials;
@@ -211,7 +212,7 @@ pub(crate) async fn fetch_available_models(
     for (index, region) in regions.iter().enumerate() {
         let result = fetch_region_models(
             client,
-            &format!("https://q.{region}.amazonaws.com"),
+            &format!("https://{}", management_host(region)),
             credentials,
             config,
             token,

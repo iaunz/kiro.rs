@@ -135,7 +135,8 @@ fn default_region() -> String {
 }
 
 fn default_kiro_version() -> String {
-    "0.11.107".to_string()
+    // 上游自 2026-11-09 起拒绝 Kiro IDE < 0.11.133 的客户端；跟随当前稳定版
+    "1.4.121".to_string()
 }
 
 fn default_system_version() -> String {
@@ -144,7 +145,8 @@ fn default_system_version() -> String {
 }
 
 fn default_node_version() -> String {
-    "22.22.0".to_string()
+    // Kiro IDE 1.4.121 内置 Electron 44 / Node 24.22.1
+    "24.22.1".to_string()
 }
 
 fn default_count_tokens_auth_type() -> String {

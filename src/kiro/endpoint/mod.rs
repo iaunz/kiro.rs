@@ -15,6 +15,32 @@ pub mod ide;
 
 pub use ide::IdeEndpoint;
 
+/// 已上线 `*.kiro.dev` 新域名的区域。
+///
+/// Kiro IDE 1.4.x 起，推理链路走 `runtime.{region}.kiro.dev`，
+/// 配置/用量/模型类接口走 `management.{region}.kiro.dev`。
+/// 实测（2026-11-09）只有这两个区域有 DNS 记录，其余区域仍须走旧的
+/// `q.{region}.amazonaws.com`（官方防火墙文档也仍列出该旧域名）。
+const KIRO_DEV_REGIONS: &[&str] = &["us-east-1", "eu-central-1"];
+
+fn kiro_service_host(service: &str, region: &str) -> String {
+    if KIRO_DEV_REGIONS.contains(&region) {
+        format!("{service}.{region}.kiro.dev")
+    } else {
+        format!("q.{region}.amazonaws.com")
+    }
+}
+
+/// 推理链路（generateAssistantResponse / mcp）的上游 host
+pub fn runtime_host(region: &str) -> String {
+    kiro_service_host("runtime", region)
+}
+
+/// 管理类接口（getUsageLimits / ListAvailableModels / ListAvailableProfiles）的上游 host
+pub fn management_host(region: &str) -> String {
+    kiro_service_host("management", region)
+}
+
 /// Kiro 端点
 ///
 /// 同一个 `KiroProvider` 可持有多个 endpoint 实现，按凭据级字段切换。
@@ -121,6 +147,22 @@ mod tests {
     fn test_default_monthly_request_limit_false() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
         assert!(!default_is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_service_hosts_use_kiro_dev_in_supported_regions() {
+        assert_eq!(runtime_host("us-east-1"), "runtime.us-east-1.kiro.dev");
+        assert_eq!(runtime_host("eu-central-1"), "runtime.eu-central-1.kiro.dev");
+        assert_eq!(
+            management_host("us-east-1"),
+            "management.us-east-1.kiro.dev"
+        );
+    }
+
+    #[test]
+    fn test_service_hosts_fall_back_to_legacy_domain() {
+        assert_eq!(runtime_host("us-west-2"), "q.us-west-2.amazonaws.com");
+        assert_eq!(management_host("eu-west-1"), "q.eu-west-1.amazonaws.com");
     }
 
     #[test]
