@@ -170,16 +170,18 @@ export function CredentialCard({
 
   return (
     <>
-      <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
-        <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
+      <Card className={`min-w-0 ${credential.isCurrent ? 'ring-2 ring-primary' : ''}`}>
+        <CardHeader className="p-4 pb-2 sm:p-6 sm:pb-2">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex min-w-0 flex-1 items-start gap-2">
               <Checkbox
                 checked={selected}
                 onCheckedChange={onToggleSelect}
+                className="mt-1"
+                aria-label={`选择凭据 #${credential.id}`}
               />
-              <CardTitle className="text-lg flex items-center gap-2">
-                {credential.email || `凭据 #${credential.id}`}
+              <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-lg leading-6 [overflow-wrap:anywhere]">
+                <span className="min-w-0 max-w-full">{credential.email || `凭据 #${credential.id}`}</span>
                 {credential.isCurrent && (
                   <Badge variant="success">当前</Badge>
                 )}
@@ -202,19 +204,20 @@ export function CredentialCard({
                 )}
               </CardTitle>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex shrink-0 items-center gap-2">
               <span className="text-sm text-muted-foreground">启用</span>
               <Switch
                 checked={!credential.disabled}
                 onCheckedChange={handleToggleDisabled}
                 disabled={setDisabled.isPending}
+                aria-label={`启用凭据 #${credential.id}`}
               />
             </div>
           </div>
         </CardHeader>
-        <CardContent className="space-y-4">
+        <CardContent className="space-y-4 p-4 pt-0 sm:p-6 sm:pt-0">
           {/* 信息网格 */}
-          <div className="grid grid-cols-2 gap-4 text-sm">
+          <div className="grid grid-cols-1 gap-x-4 gap-y-3 text-sm [overflow-wrap:anywhere] sm:grid-cols-2">
             <div>
               <span className="text-muted-foreground">优先级：</span>
               {editingPriority ? (
@@ -281,17 +284,17 @@ export function CredentialCard({
               <span className="text-muted-foreground">成功次数：</span>
               <span className="font-medium">{credential.successCount}</span>
             </div>
-            <div className="col-span-2">
+            <div className="col-span-full">
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
             </div>
             {credential.maskedApiKey && (
-              <div className="col-span-2">
+              <div className="col-span-full">
                 <span className="text-muted-foreground">API Key：</span>
                 <span className="font-mono font-medium">{credential.maskedApiKey}</span>
               </div>
             )}
-            <div className="col-span-2">
+            <div className="col-span-full">
               <span className="text-muted-foreground">剩余用量：</span>
               {loadingBalance ? (
                 <span className="text-sm ml-1">
@@ -309,13 +312,13 @@ export function CredentialCard({
               )}
             </div>
             {credential.hasProxy && (
-              <div className="col-span-2">
+              <div className="col-span-full">
                 <span className="text-muted-foreground">代理：</span>
                 <span className="font-medium">{credential.proxyUrl}</span>
               </div>
             )}
             {credential.hasProfileArn && (
-              <div className="col-span-2">
+              <div className="col-span-full">
                 <Badge variant="secondary">有 Profile ARN</Badge>
               </div>
             )}

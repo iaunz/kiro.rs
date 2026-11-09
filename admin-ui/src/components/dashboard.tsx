@@ -542,12 +542,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
     <div className="min-h-screen bg-background">
       {/* 顶部导航 */}
       <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-        <div className="container flex h-14 items-center justify-between px-4 md:px-8">
-          <div className="flex items-center gap-2">
+        <div className="container mx-auto flex min-h-14 flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-2 md:px-8">
+          <div className="flex shrink-0 items-center gap-2">
             <Server className="h-5 w-5" />
             <span className="font-semibold">Kiro Admin</span>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="ml-auto flex flex-wrap items-center gap-1 sm:gap-2">
             <Button
               variant="outline"
               size="sm"
@@ -557,13 +557,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
             >
               {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
             </Button>
-            <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
+            <Button variant="ghost" size="icon" onClick={toggleDarkMode} aria-label="切换主题">
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleRefresh}>
+            <Button variant="ghost" size="icon" onClick={handleRefresh} aria-label="刷新凭据列表">
               <RefreshCw className="h-5 w-5" />
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleLogout}>
+            <Button variant="ghost" size="icon" onClick={handleLogout} aria-label="退出登录">
               <LogOut className="h-5 w-5" />
             </Button>
           </div>
@@ -612,9 +612,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
         {/* 凭据列表 */}
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <h2 className="text-xl font-semibold">凭据管理</h2>
+          <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+            <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2">
+              <h2 className="shrink-0 whitespace-nowrap text-xl font-semibold">凭据管理</h2>
               {selectedIds.size > 0 && (
                 <div className="flex items-center gap-2">
                   <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
@@ -624,7 +624,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 </div>
               )}
             </div>
-            <div className="flex gap-2">
+            <div className="flex min-w-0 flex-wrap gap-2 xl:justify-end">
               {selectedIds.size > 0 && (
                 <>
                   <Button onClick={handleBatchVerify} size="sm" variant="outline">
@@ -712,7 +712,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Card>
           ) : (
             <>
-              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 2xl:grid-cols-3">
                 {currentCredentials.map((credential) => (
                   <CredentialCard
                     key={credential.id}
@@ -728,7 +728,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
               {/* 分页控件 */}
               {totalPages > 1 && (
-                <div className="flex justify-center items-center gap-4 mt-6">
+                <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
                   <Button
                     variant="outline"
                     size="sm"
@@ -737,7 +737,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   >
                     上一页
                   </Button>
-                  <span className="text-sm text-muted-foreground">
+                  <span className="order-first w-full text-center text-sm text-muted-foreground sm:order-none sm:w-auto">
                     第 {currentPage} / {totalPages} 页（共 {data?.credentials.length} 个凭据）
                   </span>
                   <Button

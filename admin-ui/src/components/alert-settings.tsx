@@ -62,8 +62,8 @@ export function AlertSettings() {
 
   return (
     <Card className="mb-6">
-      <CardHeader>
-        <CardTitle className="flex items-center justify-between">
+      <CardHeader className="p-4 sm:p-6">
+        <CardTitle className="flex flex-wrap items-center justify-between gap-2 text-xl sm:text-2xl">
           <span>Credit 预警设置</span>
           {status && (
             <Badge variant={status.fired ? 'destructive' : 'secondary'}>
@@ -72,12 +72,12 @@ export function AlertSettings() {
           )}
         </CardTitle>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-4 p-4 pt-0 sm:p-6 sm:pt-0">
         <div className="flex items-center gap-2">
           <Switch checked={enabled} onCheckedChange={setEnabled} />
           <span className="text-sm">启用预警</span>
         </div>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div>
             <label className="text-sm text-muted-foreground">阈值（总剩余低于）</label>
             <Input value={threshold} onChange={(e) => setThreshold(e.target.value)} />
@@ -107,13 +107,13 @@ export function AlertSettings() {
           </div>
           <div className="space-y-2">
             {config?.channels.map((ch) => (
-              <div key={ch.id} className="flex items-center justify-between rounded border px-3 py-2 text-sm">
-                <div className="flex items-center gap-2">
+              <div key={ch.id} className="flex flex-wrap items-center justify-between gap-2 rounded border px-3 py-2 text-sm">
+                <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 [overflow-wrap:anywhere]">
                   <Badge variant="outline">{ch.kind}</Badge>
-                  <span>{ch.name || (ch.kind === 'telegram' ? ch.maskedBotToken : ch.to)}</span>
+                  <span className="min-w-0">{ch.name || (ch.kind === 'telegram' ? ch.maskedBotToken : ch.to)}</span>
                   {!ch.enabled && <Badge variant="secondary">已禁用</Badge>}
                 </div>
-                <div className="flex gap-1">
+                <div className="ml-auto flex shrink-0 gap-1">
                   <Button size="icon" variant="ghost" onClick={() => { setEditing(ch); setDialogOpen(true) }}>
                     <Pencil className="h-4 w-4" />
                   </Button>
